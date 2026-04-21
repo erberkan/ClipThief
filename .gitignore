@@ -1,0 +1,43 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+C2/venv/
+
+# C2 runtime data
+C2/c2_data.db
+C2/downloads/
+
+# Visual Studio / C++ build outputs
+ClipboardDump/.vs/
+ClipboardDump/x64/
+ClipboardDump/ClipboardDump/x64/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.db-shm
+*.VC.db-wal
+*.opendb
+*.vsidx
+*.ipch
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.pdb
+*.tlog
+*.obj
+*.log
+*.exe.recipe
+*.FileListAbsolute.txt
