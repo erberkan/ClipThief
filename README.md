@@ -240,22 +240,25 @@ Send KILL command? This will destroy the agent [y/n]:
 `y` ile onaylayın. Agent bir sonraki polling'de (max 3 saniye) komutu alır ve:
 
 1. Registry'deki `AgentID` değerini siler
-2. Kendini silecek bir batch dosyası oluşturur (`%TEMP%`)
-3. Process'i sonlandırır
+2. Persistence Run key'ini siler (varsa)
+3. Kendini silecek bir batch dosyası oluşturur (`%TEMP%`)
+4. Process'i sonlandırır
 
 > **Not:** EXE silme işlemi `ShellExecuteA` ile tetiklenir; bazı Windows 10/11 ortamlarında başarısız olabilir. C2 agent'ı `✗ dead` olarak işaretler; disk üzerinde kalabilir.
 
-### PERSIST — Scheduled Task
+### PERSIST — HKCU Run Key
 
 Agent menüsünden `[3]` ile gönderin.
 
-- **Task adı:** `WindowsUpdateChecker`
-- **Tetikleyici:** Her kullanıcı girişinde (`onlogon`)
-- **Yetki:** En yüksek (`highest`)
+Agent kendini HKCU Run registry key'ine ekler — **yönetici yetkisi gerekmez:**
+
+- **Registry yolu:** `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+- **Değer adı:** `WindowsUpdateChecker`
+- **Tetikleyici:** Her kullanıcı girişinde otomatik
 
 Elle kaldırmak için:
 ```cmd
-schtasks /delete /tn "WindowsUpdateChecker" /f
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdateChecker /f
 ```
 
 ---
@@ -377,8 +380,8 @@ ClipThief/
 
 ```
 Agent tarafı:
-  kill komutu       → registry + EXE silinir (C2 menüsünden)
-  Scheduled task    → schtasks /delete /tn "WindowsUpdateChecker" /f
+  kill komutu       → registry + Run key + EXE silinir (C2 menüsünden)
+  Persistence       → reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdateChecker /f
 
 C2 tarafı:
   Tek agent sil     → Agent Menüsü → [4]
